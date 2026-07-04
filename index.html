@@ -32,18 +32,23 @@
   <div class="keys">
     <b>mouse</b> look &nbsp; <b>W A S D</b> fly &nbsp; <b>space/shift</b> rise/sink &nbsp;
     <b>scroll</b> speed &nbsp; <b>Q/E</b> roll<br>
-    <b>F</b> auto-dive &nbsp; <b>H</b> help &nbsp; <b>1/2/3</b> quality &nbsp; <b>N</b> new world
+    <b>F</b> auto-dive &nbsp; <b>L</b> drop light &nbsp; <b>H</b> help &nbsp;
+    <b>1/2/3</b> quality &nbsp; <b>N</b> new world
   </div>
 </div>
 
 <div id="help" class="hidden">
   <div class="help-title">How to explore</div>
-  <p>Fly toward any surface. Your speed scales with your distance to it — you
-  will never quite arrive. As you close in, the world <i>rebases</i>: new detail
-  grows beneath you while the structures you left behind become colossal
-  vistas overhead. The terrain style, palette and lights change as you go
-  deeper. There is no lower bound: depth level and total zoom are shown top-left.</p>
-  <p><b>Scroll</b> adjusts your speed multiplier. <b>F</b> lets the autopilot
+  <p>Fly toward any surface. As you close in, the world <i>rebases</i>: new
+  detail grows beneath you while the structures you left behind become
+  colossal vistas overhead. <b>Scroll</b> sets your speed — it is the only
+  thing that does — and every rebase carries it across scales, so ×1 always
+  feels the same relative to the terrain around you. The terrain style,
+  palette and lights change as you go deeper. There is no lower bound: depth
+  level and total zoom are shown top-left.</p>
+  <p><b>L</b> drops a point light sized to your current scale — handy in dark
+  interiors. Hold still and the renderer accumulates frames into a smooth,
+  supersampled image (ideal for screenshots). <b>F</b> lets the autopilot
   dive for you. <b>N</b> generates a fresh universe (shareable via the URL).
   <b>1/2/3</b> set render quality (shadows &amp; light shadows). <b>G</b> toggles
   light glow. <b>P</b> pauses.</p>

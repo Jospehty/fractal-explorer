@@ -48,7 +48,7 @@
         this.keys.add(e.code);
         const map = {
           KeyF: 'auto', KeyH: 'help', KeyP: 'pause', KeyN: 'newseed',
-          Digit1: 'q0', Digit2: 'q1', Digit3: 'q2', KeyG: 'glow',
+          Digit1: 'q0', Digit2: 'q1', Digit3: 'q2', KeyG: 'glow', KeyL: 'light',
         };
         if (map[e.code]) this.onToggle(map[e.code]);
       });
@@ -57,8 +57,10 @@
 
       canvas.addEventListener('wheel', (e) => {
         e.preventDefault();
+        // scroll is the ONLY speed control (movement speed is otherwise
+        // constant per zoom level), so give it a wide range
         this.speedMult *= Math.exp(-e.deltaY * 0.0011);
-        this.speedMult = Math.min(Math.max(this.speedMult, 0.02), 40);
+        this.speedMult = Math.min(Math.max(this.speedMult, 0.02), 100);
       }, { passive: false });
 
       // ---- touch: 1 finger = look, 2 fingers = fly forward / pinch = speed
@@ -88,7 +90,7 @@
             if (touches.has(t.identifier)) touches.set(t.identifier, { x: t.clientX, y: t.clientY });
           const [a, b] = [...touches.values()];
           const nd = Math.hypot(a.x - b.x, a.y - b.y);
-          if (pinchDist > 0) this.speedMult = Math.min(Math.max(this.speedMult * (nd / pinchDist), 0.02), 40);
+          if (pinchDist > 0) this.speedMult = Math.min(Math.max(this.speedMult * (nd / pinchDist), 0.02), 100);
           pinchDist = nd;
           this._touchForward = 1; // two fingers down = fly forward
         }

@@ -176,16 +176,24 @@
     const foldL = 1.0;
     const trans = [-k * pull[0], -k * pull[1], -k * pull[2]];
 
-    // Palette: biome hue drifting per level; deeper values, saturated
-    const hue = biome.hue + sr(14) * biome.hueSpread;
-    const pal = hsv(hue, Math.min(1, biome.sat * (0.9 + r(15) * 0.5)), 0.34 + r(16) * 0.42);
+    // Palette: hue/sat/value drift SMOOTHLY with depth across the zone
+    // (independent per-level jitter made adjacent levels' surface colors jump;
+    // combined with the shader's trap crossfade this gives gradual gradients).
+    const zlen = Math.max(1, zone.end - zone.start);
+    const zt = (j - zone.start) / zlen; // 0..1 position within the zone
+    const hue = biome.hue + (zt - 0.5) * 2.0 * biome.hueSpread + sr(14) * biome.hueSpread * 0.2;
+    const sat = Math.min(1, biome.sat * (1.0 + (r(15) - 0.5) * 0.25));
+    const val = 0.40 + 0.28 * (0.5 + 0.5 * Math.sin(zt * 6.2832 + biome.hue * 40.0)) + (r(16) - 0.5) * 0.06;
+    const pal = hsv(hue, sat, val);
     const emissive = biome.emissive && r(17) < 0.5 ? 0.6 + r(18) * 2.2 : 0.0;
 
     // Point light spec for this level (spawned when the camera descends into it).
-    const lightSpawn = r(20) < 0.35;
+    // Sparse and dim by design: the mood targets dark interiors with pools of
+    // light, not a uniformly lit world.
+    const lightSpawn = r(20) < 0.22;
     const lightCol = hsv(biome.lightHue + sr(21) * 0.08, 0.55 + r(22) * 0.4, 1.0);
     const lightOff = [sr(23), sr(24) * 0.6 + 0.25, sr(25)]; // camera-relative spawn offset
-    const lightInt = 0.05 + r(26) * 0.2;
+    const lightInt = 0.035 + r(26) * 0.12;
 
     return {
       level: j, zone: zone.index, biome, style, scale, rot, trans, foldL,

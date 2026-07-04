@@ -54,7 +54,13 @@
      old fold plane. */
   const B_MIN = 8;
   const B_HARD = 24;
-  const HORIZON = 3.0e4;  // matches the renderer far fog/TMAX distance
+  /* The renderer marches to TMAX = 6e4 but guarantees FULL fog by 0.92*TMAX
+     = 5.5e4 (see the horizon fade in shaders.js), so geometry changes beyond
+     2*HORIZON = 6e4 are invisible. Do NOT raise HORIZON without re-validating
+     test/world.test.js: a larger outer window increases fold-boundary
+     double-crossings when transporting near-camera points across rebases
+     (the test's outlier budget) and erodes far-field f32 accuracy. */
+  const HORIZON = 3.0e4;
   const N_INNER = 16;     // inner detail levels
   const SLOTS = B_HARD + N_INNER;
   const ESCAPE2 = 900.0;  // escape radius^2 for the orbit
@@ -201,6 +207,7 @@
       this.log10Zoom = 0;
       this.sunDir = V.norm([0.55, 0.75, 0.35]);
       this.lights = [];                     // {pos (frame K), col, radius, intensity, level}
+      this._litLevels = new Set();          // levels that already spawned their light (never respawn)
       this.pendingRot = V.mIdent();         // accumulated frame rotation for the renderer's camera basis
       this._pcache = new Map();
       this.updateChain();
@@ -421,7 +428,12 @@
     _spawnLight() {
       const P = this.params(this.K);
       if (!P.light.spawn) return;
-      if (this.lights.some((L) => L.level === this.K)) return;
+      // A level spawns its light at most ONCE per session. Checking the live
+      // light list is not enough: zooming out prunes the light (radius decay),
+      // so bouncing in and out of an area used to pile up fresh full-intensity
+      // copies until the frame washed out.
+      if (this._litLevels.has(this.K)) return;
+      this._litLevels.add(this.K);
       const g = this.grad(this.camPos);
       const o = P.light.off;
       const pos = V.add(this.camPos, V.add(V.scale(g, 0.9), V.scale(o, 0.9)));
@@ -429,6 +441,19 @@
         pos, col: P.light.col, radius: 0.035, intensity: P.light.intensity,
         level: this.K, spawnZoom: this.log10Zoom,
       });
+    }
+
+    /* Manual light drop (L key). Placed just ahead of the camera in frame-K
+       units, so it is automatically sized to the current zoom scale and is
+       carried through rebases like any spawned light. */
+    addUserLight(forward, col) {
+      const de = Math.max(Math.abs(this.de(this.camPos)), 0.005);
+      const pos = V.add(this.camPos, V.scale(forward, Math.min(de * 2.0, 0.12) + 0.02));
+      this.lights.push({
+        pos, col: col || this.params(this.K).light.col, radius: 0.02, intensity: 0.12,
+        level: this.K, spawnZoom: this.log10Zoom,
+      });
+      this._pruneLights();
     }
     _pruneLights() {
       // beyond ~1e4 units the fog extinction makes a light invisible

@@ -101,6 +101,13 @@
     deCam: world.de(world.camPos),
   };
 
+  let msgTimer = null;
+  function flashMsg(text) {
+    hud.msg.textContent = text;
+    clearTimeout(msgTimer);
+    msgTimer = setTimeout(() => { hud.msg.textContent = ''; }, 1600);
+  }
+
   input.onToggle = (what, val) => {
     if (what === 'lock') {
       overlay.classList.toggle('hidden', val);
@@ -113,6 +120,7 @@
     if (what === 'q0') state.quality = 0;
     if (what === 'q1') state.quality = 1;
     if (what === 'q2') state.quality = 2;
+    if (what === 'light') { world.addUserLight(cam.forward); flashMsg('light dropped'); }
     if (what === 'newseed') {
       location.href = location.pathname + '?seed=' + ((Math.random() * 0xffffffff) >>> 0);
     }
@@ -120,6 +128,20 @@
 
   /* ---- movement with collision (DE is a safe lower bound) ---- */
   const MIN_DE = 0.0035;
+  // Manual flight speed in frame-K units/s at multiplier ×1. Constant on
+  // purpose: the user's scroll wheel is the ONLY thing that changes speed,
+  // and rebasing rescales the frame, which carries the same APPARENT speed
+  // across zoom levels. (The old DE-proportional speed auto-slowed you into
+  // surfaces and sped you up as you left — removed per playtest feedback.)
+  const FLY_SPEED = 0.06;
+
+  // Rebases and wedge corrections can apply REFLECTIONS (det = -1) to the
+  // camera basis. The mirrored world renders identically (the reflection is an
+  // exact symmetry — that's why rebasing is seamless), but the apparent sense
+  // of every screen-space rotation inverts with the basis handedness. Track
+  // the accumulated parity and flip the user's look/roll input by it, so
+  // controls never reverse after a zoom-level snap.
+  let camParity = 1;
   function tryMove(delta) {
     let remaining = V.len(delta);
     if (remaining <= 0) return;
@@ -191,7 +213,8 @@
     hud.zoom.textContent = 'zoom 10^' + z.toFixed(1);
     hud.speed.textContent = 'speed ×' + input.speedMult.toFixed(2);
     hud.fps.textContent = fps.toFixed(0) + ' fps';
-    hud.res.textContent = Math.round(renderer.resScale * 100) + '%';
+    hud.res.textContent = Math.round(renderer.resScale * 100) + '%' +
+      (renderer.accumN > 1 ? ' • still ×' + renderer.accumN : '');
   }
 
   /* ---- main loop ---- */
@@ -204,22 +227,27 @@
     if (state.paused) return;
     if (DET) dt = 1 / 60;
 
-    // look
+    // look (parity-corrected so reflections never invert the controls)
     const [yd, pd] = input.consumeLook();
-    if (yd) rotateBasis(cam.up, yd);
-    if (pd) rotateBasis(cam.right, pd);
     const roll = input.rollInput();
-    if (roll) rotateBasis(cam.forward, roll * 1.4 * dt);
-    orthonormalize();
+    if (yd) rotateBasis(cam.up, yd * camParity);
+    if (pd) rotateBasis(cam.right, pd * camParity);
+    if (roll) rotateBasis(cam.forward, roll * 1.4 * dt * camParity);
+    // only re-orthonormalize when the basis actually changed: a perfectly
+    // still camera must produce bit-identical uniforms for frame accumulation
+    if (yd || pd || roll) orthonormalize();
 
-    // move: speed scales with distance to the surface (the infinite-zoom feel)
+    // move
     state.deCam = world.de(world.camPos);
+    let moving = false;
     if (state.auto) {
       autopilot(dt);
+      moving = true;
     } else {
       const mv = input.moveVector();
       if (mv[0] || mv[1] || mv[2]) {
-        const speed = Math.max(state.deCam, MIN_DE) * 0.9 * input.speedMult;
+        moving = true;
+        const speed = FLY_SPEED * input.speedMult;
         const delta = V.add(
           V.add(V.scale(cam.right, mv[0] * speed * dt), V.scale(cam.up, mv[1] * speed * dt)),
           V.scale(cam.forward, mv[2] * speed * dt));
@@ -230,8 +258,15 @@
     // rebase to keep camera-local numbers O(1); rotate the view basis along
     state.deCam = world.rebaseToCamera();
     const R = world.takeFrameRotation();
-    if (R[0] !== 1 || R[4] !== 1 || R[8] !== 1 ||
-        R[1] !== 0 || R[2] !== 0 || R[3] !== 0 || R[5] !== 0 || R[6] !== 0 || R[7] !== 0) {
+    const rotApplied =
+      R[0] !== 1 || R[4] !== 1 || R[8] !== 1 ||
+      R[1] !== 0 || R[2] !== 0 || R[3] !== 0 || R[5] !== 0 || R[6] !== 0 || R[7] !== 0;
+    if (rotApplied) {
+      const detR =
+        R[0] * (R[4] * R[8] - R[5] * R[7]) -
+        R[1] * (R[3] * R[8] - R[5] * R[6]) +
+        R[2] * (R[3] * R[7] - R[4] * R[6]);
+      if (detR < 0) camParity = -camParity;
       cam.right = V.norm(V.mMulV(R, cam.right));
       cam.up = V.norm(V.mMulV(R, cam.up));
       cam.forward = V.norm(V.mMulV(R, cam.forward));
@@ -240,13 +275,17 @@
     }
     world.updateChain();
 
+    // a still camera enables the renderer's accumulation path (anti-shimmer +
+    // supersampled screenshots); any input, motion or rebase resets it
+    const still = !moving && !yd && !pd && !roll && !rotApplied;
+
     const t0 = performance.now();
     renderer.render(world, cam, {
       time: now / 1000, fov: state.fov, quality: state.quality,
-      sunCol: state.sunCol, glow: state.glow, deCam: state.deCam,
+      sunCol: state.sunCol, glow: state.glow, deCam: state.deCam, still,
     });
     const frameMs = performance.now() - t0 + dt * 0; // render cost only
-    renderer.adaptResolution(Math.max(frameMs, dt * 1000 * 0.5));
+    if (!still) renderer.adaptResolution(Math.max(frameMs, dt * 1000 * 0.5));
 
     fpsEma = fpsEma * 0.95 + (1 / Math.max(dt, 1e-3)) * 0.05;
     updateHUD(dt, fpsEma);
@@ -259,12 +298,18 @@
     renderer.resScale = renderer.fixedScale;
     window.__explorer = {
       world, cam, state, input, renderer,
+      get parity() { return camParity; },
       step(n) { // advance autopilot n fixed frames without rAF timing
         for (let i = 0; i < n; i++) {
           state.deCam = world.de(world.camPos);
           autopilot(1 / 60);
           world.rebaseToCamera();
           const R = world.takeFrameRotation();
+          const detR =
+            R[0] * (R[4] * R[8] - R[5] * R[7]) -
+            R[1] * (R[3] * R[8] - R[5] * R[6]) +
+            R[2] * (R[3] * R[7] - R[4] * R[6]);
+          if (detR < 0) camParity = -camParity;
           cam.right = V.norm(V.mMulV(R, cam.right));
           cam.up = V.norm(V.mMulV(R, cam.up));
           cam.forward = V.norm(V.mMulV(R, cam.forward));

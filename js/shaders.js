@@ -45,6 +45,7 @@
   uniform int   uQuality;    // 0 low, 1 medium, 2 high
   uniform float uGlowAmt;
   uniform float uBound;
+  uniform vec2  uJitter;     // sub-pixel jitter for still-frame accumulation
 
   layout(std140) uniform Params {
     vec4 lvl[SLOTS * 6];        // per slot: rot0(w=scale) rot1(w=style) rot2(w=foldL) trans(w=emissive) pal spare
@@ -75,14 +76,19 @@
 
   /* ---- two-phase distance estimator ----
      p: camera-relative frame-K position. coneEps: feature size below which we
-     band-limit (adaptive iteration count). trapOut: (slotOfTrapMin, trapMin). */
-  float map(vec3 p, float coneEps, out vec3 trapOut) {
+     band-limit (adaptive iteration count).
+     trapOut: (slotA, trapA, slotB, trapB) — the two smallest orbit traps and
+     their owning level slots. Shading crossfades the two slots' palettes by
+     trap separation, so colors blend smoothly where trap ownership changes
+     instead of snapping (both across surfaces and while zooming).
+     planeTrap: independent plane trap that drives the emissive veins. */
+  float map(vec3 p, float coneEps, out vec4 trapOut, out float planeTrap) {
     vec3 x;
     float dr;
     bool esc = false;
-    float trap = 1e9;
+    float m1 = 1e9, m2 = 1e9;            // two smallest traps
+    float s1 = float(uB), s2 = float(uB); // and their slots
     float trapP = 1e9; // plane trap: varies across surfaces (emissive veins)
-    float tslot = float(uB);
     if (uB > 0) {
       vec3 d = uW * p;
       dr = uWScale;
@@ -105,7 +111,8 @@
         {
           vec3 xs = cn + d;
           float ms = length(xs) * 0.9 + 0.12 * abs(xs.y);
-          if (ms < trap) { trap = ms; tslot = float(b); }
+          if (ms < m1) { m2 = m1; s2 = s1; m1 = ms; s1 = float(b); }
+          else if (ms < m2) { m2 = ms; s2 = float(b); }
           trapP = min(trapP, abs(xs.z + 0.4 * xs.x - 0.35));
         }
       }
@@ -119,21 +126,23 @@
         int s = uB + i;
         x = foldLevel(x, s);
         dr *= lvl[s*6].w;
-        float m2 = dot(x, x);
-        float m = sqrt(m2) * 0.9 + 0.12 * abs(x.y); // slight anisotropy for banding
-        if (m < trap) { trap = m; tslot = float(s); }
+        float xx2 = dot(x, x);
+        float m = sqrt(xx2) * 0.9 + 0.12 * abs(x.y); // slight anisotropy for banding
+        if (m < m1) { m2 = m1; s2 = s1; m1 = m; s1 = float(s); }
+        else if (m < m2) { m2 = m; s2 = float(s); }
         trapP = min(trapP, abs(x.z + 0.4 * x.x - 0.35));
-        if (m2 > ESCAPE2) break;
+        if (xx2 > ESCAPE2) break;
         ${global.__SHADER_DEBUG === 'nocone' ? '' : 'if (1.0 < dr * coneEps) break;'}
       }
     }
-    trapOut = vec3(tslot, trap, trapP);
+    trapOut = vec4(s1, m1, s2, m2);
+    planeTrap = trapP;
     // (|x| - R)/dr is a rigorous distance lower bound for any truncation depth
     // (R = attractor bounding radius, uploaded per frame) — hole-free LOD.
     return (length(x) - uBound) / dr;
   }
 
-  float mapD(vec3 p, float coneEps) { vec3 t; return map(p, coneEps, t); }
+  float mapD(vec3 p, float coneEps) { vec4 t; float pl; return map(p, coneEps, t, pl); }
 
   vec3 calcNormal(vec3 p, float eps, float coneEps) {
     vec2 k = vec2(1.0, -1.0);
@@ -205,23 +214,25 @@
     if (uProbeOn > 0.5) {
       // debug: output map(uProbe) bit-exactly, one byte per pixel in R
       // (alpha channel is unusable on an opaque canvas)
-      vec3 tt;
-      float dv = map(uProbe, 0.0, tt);
+      vec4 tt; float tp;
+      float dv = map(uProbe, 0.0, tt, tp);
       uint bb = floatBitsToUint(dv);
       uint sh = uint(gl_FragCoord.x) * 8u;
       fragColor = vec4(float((bb >> sh) & 255u) / 255.0, 0.0, 0.0, 1.0);
       return;
     }
-    vec2 uv = (gl_FragCoord.xy * 2.0 - uRes) / uRes.y;
+    // uJitter: sub-pixel offset for still-frame accumulation (zero when moving)
+    vec2 uv = ((gl_FragCoord.xy + uJitter) * 2.0 - uRes) / uRes.y;
     float pix = 2.0 * uFovTan / uRes.y;              // radians per pixel (approx)
     vec3 rd = normalize(uCamBasis * vec3(uv * uFovTan, 1.0));
     vec3 ro = vec3(0.0);                             // camera at origin of frame K
 
-    const float TMAX = 3.0e4;
+    const float TMAX = 6.0e4;
     int   MAXSTEP = uQuality == 0 ? 100 : (uQuality == 1 ? 150 : 210);
     float t = 0.0;
     float d = 0.0;
-    vec3 trap = vec3(0.0);
+    vec4 trap = vec4(0.0);
+    float trapPl = 1e9;
     bool hit = false;
     bool exhausted = false;
     int steps = 0;
@@ -230,7 +241,7 @@
       if (i >= MAXSTEP) { hit = true; exhausted = true; break; } // grazing geometry
       steps = i;
       vec3 p = ro + rd * t;
-      d = map(p, t * pix * 0.22, trap);
+      d = map(p, t * pix * 0.22, trap, trapPl);
       if (d < t * pix * 0.45 + 2e-6) { hit = true; break; }
       t += min(d, TMAX * 0.5) * 0.92;
     }
@@ -253,11 +264,17 @@
       if (dot(n, rd) > 0.0) n = -n;
 
       int slot = int(trap.x + 0.5);
-      vec3 alb = palette(slot);
+      int slotB = int(trap.z + 0.5);
+      // crossfade the two nearest-trap palettes by trap separation: where the
+      // argmin is about to switch (trapA ~ trapB) the blend is 50/50, so level
+      // colors shift as smooth gradients instead of snapping at trap-ownership
+      // boundaries — in space across a surface AND in time while zooming
+      float sep = clamp((trap.w - trap.y) / (0.25 * (trap.y + trap.w) + 1e-5), 0.0, 1.0);
+      float wA = 0.5 + 0.5 * sep * sep * (3.0 - 2.0 * sep); // smoothstep easing
+      vec3 alb = mix(palette(slotB), palette(slot), wA);
       // trap-based tone variation: crevices darken, ridges lighten
       float tv = clamp(trap.y * 0.7, 0.0, 1.4);
       alb *= 0.45 + 0.62 * tv;
-      alb = mix(alb, palette(min(slot + 1, SLOTS - 1)), 0.25); // soften level color seams
 
       float ao = calcAO(p, n, max(t * 0.05, 0.02), coneEps);
       float ao2 = ao * ao;
@@ -273,13 +290,14 @@
         ? 'fragColor = vec4(dot(alb, vec3(0.33)), sunDiff * sh, ao, 1.0); return;'
         : ''}
       // deep interiors get little sun: keep ambient LOW so point lights,
-      // emissive veins and the headlight carry the mood
-      vec3 amb = (uSkyCol * (0.30 + 0.25 * n.y) * 0.34 + uFogCol * 0.10) * (ao2 * 0.85 + 0.15);
+      // emissive veins and the headlight carry the mood — dark corners are a
+      // feature, the sun + shadows sculpt the vistas
+      vec3 amb = (uSkyCol * (0.30 + 0.25 * n.y) * 0.26 + uFogCol * 0.08) * (ao2 * 0.85 + 0.15);
       col = alb * (amb + uSunCol * sunDiff * sh * 1.15);
       col += uSunCol * spec * sh * sunDiff;
       // headlight: soft camera-attached fill so unlit caves stay readable
       float head = max(dot(n, -rd), 0.0);
-      col += alb * (0.30 * head * head * ao / (1.0 + t * t * 0.20));
+      col += alb * (0.22 * head * head * ao / (1.0 + t * t * 0.20));
 
       vec3 dbgBase = col;
       // point lights
@@ -291,7 +309,7 @@
         float dist2 = dot(lv, lv);
         // fog extinction keeps receding giant suns from stacking overexposure;
         // the clamp bounds worst-case contribution of a light hugging a wall
-        float atten = min(uLightCol[li].w / (dist2 + rad * rad), 1.5) * exp(-sqrt(dist2) * 2.5e-4);
+        float atten = min(uLightCol[li].w / (dist2 + rad * rad), 0.9) * exp(-sqrt(dist2) * 2.5e-4);
         if (atten < 0.002) continue;
         vec3 ld = lv * inversesqrt(dist2);
         float diff = max(dot(n, ld), 0.0);
@@ -303,12 +321,13 @@
         col += uLightCol[li].rgb * (diff + lspec) * atten * lsh;
       }
 
-      // emissive veins by level
+      // emissive veins by level (blended across the same two trap slots as
+      // the albedo so vein color/strength never snaps either)
       ${global.__SHADER_DEBUG === 'noemis' ? '' : `
-      float em = emissiveOf(slot);
+      float em = mix(emissiveOf(slotB), emissiveOf(slot), wA);
       if (em > 0.0) {
-        float vein = smoothstep(0.07, 0.012, trap.z);
-        col += palette(slot) * em * vein * (0.6 + 0.4 * ao);
+        float vein = smoothstep(0.07, 0.012, trapPl);
+        col += mix(palette(slotB), palette(slot), wA) * em * vein * (0.6 + 0.4 * ao);
       }`}
       dbgLights = col - dbgBase;
     } else {
@@ -316,10 +335,15 @@
       t = TMAX;
     }
 
-    // distance fog toward mood color (keeps giant vistas readable)
-    float fog = 1.0 - exp(-fogT * 8.0e-5);
+    // distance fog toward mood color (keeps giant vistas readable). Constants
+    // are softer than the far plane needs, so distant structure stays visible
+    // for most of the range...
+    float fog = 1.0 - exp(-fogT * 4.5e-5);
     if (exhausted) fog = max(fog, 0.5); // soften silhouette-grazing speckle
-    fog = mix(fog, 1.0 - exp(-fogT * 3.0e-5), 0.5);
+    fog = mix(fog, 1.0 - exp(-fogT * 1.8e-5), 0.5);
+    // ...and this guarantees FULL fog before TMAX, so the farthest vistas fade
+    // into the haze instead of popping out of existence at the far plane.
+    fog = max(fog, smoothstep(0.55 * TMAX, 0.92 * TMAX, fogT));
     vec3 fogCol = mix(uFogCol, skyColor(rd), 0.35);
     col = mix(col, fogCol, hit ? fog : fog * 0.25);
 
@@ -333,8 +357,8 @@
       float ext = exp(-length(uLightPos[li].xyz) * 2.5e-4); // fog extinction of the glow
       // tight orb profile: the raw 1/h scatter is too broad and washes the
       // whole frame; sc^2/(1+sc/2) keeps a hot core with negligible skirt
-      float orb = uLightCol[li].w * sc * sc * 0.02 / (1.0 + 0.5 * sc);
-      col += uLightCol[li].rgb * min(orb, 1.5) * ext * uGlowAmt;
+      float orb = uLightCol[li].w * sc * sc * 0.013 / (1.0 + 0.5 * sc);
+      col += uLightCol[li].rgb * min(orb, 0.9) * ext * uGlowAmt;
     }
     // sun glare kept subtle when occluded
     col += uSunCol * pow(max(dot(rd, uSunDir), 0.0), 8.0) * 0.03;
@@ -350,7 +374,22 @@
     fragColor = vec4(col, 1.0);
   }`;
 
-  const Shaders = { VERT, FRAG };
+  /* Accumulation blit: out = mix(prev, src, blend). Used two ways by the
+     renderer: blend = 1/n averages a new jittered frame into the running
+     accumulation; blend = 1 is a plain copy (display pass). texelFetch —
+     the targets are always the exact canvas size, no filtering wanted. */
+  const BLIT_FRAG = `#version 300 es
+  precision highp float;
+  uniform sampler2D uSrc;
+  uniform sampler2D uPrev;
+  uniform float uBlend;
+  out vec4 fragColor;
+  void main() {
+    ivec2 px = ivec2(gl_FragCoord.xy);
+    fragColor = mix(texelFetch(uPrev, px, 0), texelFetch(uSrc, px, 0), uBlend);
+  }`;
+
+  const Shaders = { VERT, FRAG, BLIT_FRAG };
   global.Shaders = Shaders;
   if (typeof module !== 'undefined' && module.exports) module.exports = Shaders;
 })(typeof window !== 'undefined' ? window : globalThis);
