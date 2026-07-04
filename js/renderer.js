@@ -155,10 +155,12 @@
     adaptResolution(frameMs) {
       if (this.fixedScale) { this.resScale = this.fixedScale; return; }
       this.emaMs = this.emaMs * 0.92 + frameMs * 0.08;
+      // gentle steps: aggressive per-frame resolution changes read as a
+      // visible sharpness pop; ~1%/frame is below notice
       if (this.emaMs > this.targetMs * 1.25) {
-        this.resScale = Math.max(this.minScale, this.resScale * 0.96);
+        this.resScale = Math.max(this.minScale, this.resScale * 0.985);
       } else if (this.emaMs < this.targetMs * 0.7) {
-        this.resScale = Math.min(this.maxScale, this.resScale * 1.02);
+        this.resScale = Math.min(this.maxScale, this.resScale * 1.01);
       }
     }
 

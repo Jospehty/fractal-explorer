@@ -41,8 +41,9 @@ function foldF32(x, slot) {
   // slot: {rotCols[9], scale, style, foldL, trans[3]}
   x = fMat(slot.rotCols, x);
   const S = slot.style;
-  if (S > 0.5 && S < 1.5) { // MENGER
-    x = f3(Math.abs(x[0]), Math.abs(x[1]), Math.abs(x[2]));
+  const fo = slot.foldOff;
+  if (S > 0.5 && S < 1.5) { // MENGER: offset abs + sort desc
+    x = f3(fo[0] + Math.abs(fr(x[0] - fo[0])), fo[1] + Math.abs(fr(x[1] - fo[1])), fo[2] + Math.abs(fr(x[2] - fo[2])));
     if (x[0] < x[1]) { const t = x[0]; x[0] = x[1]; x[1] = t; }
     if (x[0] < x[2]) { const t = x[0]; x[0] = x[2]; x[2] = t; }
     if (x[1] < x[2]) { const t = x[1]; x[1] = x[2]; x[2] = t; }
@@ -57,8 +58,8 @@ function foldF32(x, slot) {
       const s2 = fr(2 * Math.min(0, dt));
       x = f3(x[0] - fr(s2 * ICO_NF[0]), x[1] - fr(s2 * ICO_NF[1]), x[2] - fr(s2 * ICO_NF[2]));
     }
-  } else { // OCTA
-    x = f3(Math.abs(x[0]), Math.abs(x[1]), Math.abs(x[2]));
+  } else { // OCTA: offset abs + partial sort
+    x = f3(fo[0] + Math.abs(fr(x[0] - fo[0])), fo[1] + Math.abs(fr(x[1] - fo[1])), fo[2] + Math.abs(fr(x[2] - fo[2])));
     if (x[0] < x[1]) { const t = x[0]; x[0] = x[1]; x[1] = t; }
     if (x[1] < x[2]) { const t = x[1]; x[1] = x[2]; x[2] = t; }
   }
@@ -77,6 +78,7 @@ function readSlots(world, ubo) {
       rotCols: [ubo[o], ubo[o + 1], ubo[o + 2], ubo[o + 4], ubo[o + 5], ubo[o + 6], ubo[o + 8], ubo[o + 9], ubo[o + 10]],
       scale: ubo[o + 3], style: ubo[o + 7], foldL: ubo[o + 11],
       trans: [ubo[o + 12], ubo[o + 13], ubo[o + 14]],
+      foldOff: [ubo[o + 20], ubo[o + 21], ubo[o + 22]],
     });
   }
   const base = WM.SLOTS * 24;

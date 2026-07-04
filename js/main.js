@@ -43,6 +43,7 @@
       scale: parseFloat(params.get('fscale')) || 0,
       spread: parseFloat(params.get('spread')) || 0,
       twist: parseFloat(params.get('twist')) || 0,
+      foldoff: parseFloat(params.get('foldoff')) || 0,
     };
   }
   const world = new WM.World(seed);

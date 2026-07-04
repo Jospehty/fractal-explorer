@@ -57,7 +57,7 @@
                              // continuous across the rebase rescale
 
   layout(std140) uniform Params {
-    vec4 lvl[SLOTS * 6];        // per slot: rot0(w=scale) rot1(w=style) rot2(w=foldL) trans(w=emissive) pal spare
+    vec4 lvl[SLOTS * 6];        // per slot: rot0(w=scale) rot1(w=style) rot2(w=foldL) trans(w=emissive) pal foldOff
     vec4 outerData[B_HARD * 4]; // per outer: jac0 jac1 jac2 (c.xyz, margin)
   };
 
@@ -70,13 +70,15 @@
       if (x.x + x.y < 0.0) x.xy = -x.yx;
       if (x.x + x.z < 0.0) x.xz = -x.zx;
       if (x.y + x.z < 0.0) x.yz = -x.zy;
-    } else if (style < 1.5) {     // MENGER: abs + sort desc
-      x = abs(x);
+    } else if (style < 1.5) {     // MENGER: offset abs + sort desc
+      vec3 fo = lvl[s*6+5].xyz;
+      x = fo + abs(x - fo);
       if (x.x < x.y) x.xy = x.yx;
       if (x.x < x.z) x.xz = x.zx;
       if (x.y < x.z) x.yz = x.zy;
-    } else if (style < 2.5) {     // OCTA: abs + partial sort
-      x = abs(x);
+    } else if (style < 2.5) {     // OCTA: offset abs + partial sort
+      vec3 fo = lvl[s*6+5].xyz;
+      x = fo + abs(x - fo);
       if (x.x < x.y) x.xy = x.yx;
       if (x.y < x.z) x.yz = x.zy;
     } else {                      // ICOSA: H3 kaleidoscope, 2x (abs + golden plane)
@@ -194,7 +196,20 @@
         x = foldLevel(x, s);
         dr *= lvl[s*6].w;
         if (dot(x, x) > ESCAPE2) break;
-        ${global.__SHADER_DEBUG === 'nocone' ? '' : 'if (1.0 < dr * coneEps) break;'}
+        ${global.__SHADER_DEBUG === 'nocone' ? '' : `
+        if (1.0 < dr * coneEps) {
+          // SMOOTH LOD: instead of truncating at a hard iteration band (which
+          // draws visible detail-rings that step as you move), blend this
+          // band's bound with one fold deeper by the fractional band
+          // position. Both are rigorous lower bounds for any truncation
+          // depth, so the mix is hole-free.
+          int s2 = min(s + 1, SLOTS - 1);
+          float sc = lvl[s2*6].w;
+          float f = clamp((dr * coneEps - 1.0) / max(sc - 1.0, 0.1), 0.0, 1.0);
+          float deA = (length(x) - uBound) / dr;
+          float deB = (length(foldLevel(x, s2)) - uBound) / (dr * sc);
+          return mix(deB, deA, f);
+        }`}
       }
     }
     return (length(x) - uBound) / dr;
@@ -346,12 +361,15 @@
       float tv = clamp(trap.y * 0.7, 0.0, 1.4);
       alb *= 0.45 + 0.62 * tv;
 
-      float ao = calcAO(p, n, max(t * 0.05, 0.02), coneEps);
+      // NOTE every absolute length here divides by uFogMul (or multiplies,
+      // for extinctions): plain frame-unit constants rescale by s at every
+      // rebase and used to make shadows/AO/headlight visibly pop per zoom step
+      float ao = calcAO(p, n, max(t * 0.05, 0.02 / uFogMul), coneEps);
       float ao2 = ao * ao;
       float sunDiff = max(dot(n, uSunDir), 0.0);
       float sh = 1.0;
       if (uQuality >= 1 && sunDiff > 0.001) {
-        sh = softShadow(p + n * eps * 3.0, uSunDir, eps * 8.0, 40.0, 9.0, coneEps, uQuality == 1 ? 40 : 64);
+        sh = softShadow(p + n * eps * 3.0, uSunDir, eps * 8.0, 40.0 / uFogMul, 9.0, coneEps, uQuality == 1 ? 40 : 64);
       }
       vec3 hv = normalize(uSunDir - rd);
       float spec = pow(max(dot(n, hv), 0.0), 42.0) * 0.45;
@@ -367,7 +385,8 @@
       col += uSunCol * spec * sh * sunDiff;
       // headlight: soft camera-attached fill so unlit caves stay readable
       float head = max(dot(n, -rd), 0.0);
-      col += alb * (0.22 * head * head * ao / (1.0 + t * t * 0.20));
+      float tf = t * uFogMul; // scale-continuous distance for the falloff
+      col += alb * (0.22 * head * head * ao / (1.0 + tf * tf * 0.20));
 
       vec3 dbgBase = col;
       // point lights: POOLS, not floodlights — the clamp is well below sun
@@ -381,7 +400,8 @@
         vec3 lv = lp - p;
         float dist2 = dot(lv, lv);
         // fog extinction keeps receding giant suns from stacking overexposure
-        float atten = min(uLightCol[li].w / (dist2 + rad * rad), 0.5) * exp(-sqrt(dist2) * 1.2e-4);
+        float atten = min(uLightCol[li].w / (dist2 + rad * rad), 0.5)
+                    * exp(-sqrt(dist2) * 1.2e-4 * uFogMul);
         if (atten < 0.002) continue;
         vec3 ld = lv * inversesqrt(dist2);
         float diff = max(dot(n, ld), 0.0);
@@ -433,7 +453,7 @@
     for (int li = 0; li < MAX_LIGHTS; li++) {
       if (li >= uLightN) break;
       float sc = inscatter(ro, rd, uLightPos[li].xyz, fogT);
-      float ext = exp(-length(uLightPos[li].xyz) * 1.2e-4); // fog extinction of the glow
+      float ext = exp(-length(uLightPos[li].xyz) * 1.2e-4 * uFogMul); // fog extinction of the glow
       // tight orb profile: the raw 1/h scatter is too broad and washes the
       // whole frame; sc^2/(1+sc/2) keeps a hot core with negligible skirt
       float orb = uLightCol[li].w * sc * sc * 0.013 / (1.0 + 0.5 * sc);

@@ -107,12 +107,20 @@
     let margin = Infinity;
     const S = P.style;
 
+    // Offset fold planes (MENGER/OCTA): the abs fold reflects across x_i=o_i
+    // instead of the coordinate planes. Still a pure reflection per op — the
+    // rebase machinery is untouched — but the copies no longer meet corner-on
+    // -corner, which breaks the monotonous perfect self-similarity (this is
+    // the Mandelbox box-fold trick). POLY/ICOSA keep concurrent planes: their
+    // preimages enumerate a group orbit, which offsets would make infinite.
+    const FO = P.foldOff || [0, 0, 0];
     if (S === LG.STYLE_MENGER) {
       if (rec) {
-        margin = Math.min(margin, Math.abs(x[0]), Math.abs(x[1]), Math.abs(x[2]));
-        M = V.mMul([Math.sign(x[0]) || 1, 0, 0, 0, Math.sign(x[1]) || 1, 0, 0, 0, Math.sign(x[2]) || 1], M);
+        margin = Math.min(margin,
+          Math.abs(x[0] - FO[0]), Math.abs(x[1] - FO[1]), Math.abs(x[2] - FO[2]));
+        M = V.mMul([Math.sign(x[0] - FO[0]) || 1, 0, 0, 0, Math.sign(x[1] - FO[1]) || 1, 0, 0, 0, Math.sign(x[2] - FO[2]) || 1], M);
       }
-      x = [Math.abs(x[0]), Math.abs(x[1]), Math.abs(x[2])];
+      x = [FO[0] + Math.abs(x[0] - FO[0]), FO[1] + Math.abs(x[1] - FO[1]), FO[2] + Math.abs(x[2] - FO[2])];
       if (rec) margin = Math.min(margin,
         Math.abs(x[0] - x[1]) / SQ2, Math.abs(x[0] - x[2]) / SQ2, Math.abs(x[1] - x[2]) / SQ2);
       if (x[0] < x[1]) { const t = x[0]; x[0] = x[1]; x[1] = t; if (rec) M = V.mMul([0,1,0, 1,0,0, 0,0,1], M); }
@@ -141,12 +149,13 @@
         }
       }
     } else {
-      // OCTA: abs fold followed by the three diagonal plane folds
+      // OCTA: (offset) abs fold followed by the two diagonal plane folds
       if (rec) {
-        margin = Math.min(margin, Math.abs(x[0]), Math.abs(x[1]), Math.abs(x[2]));
-        M = V.mMul([Math.sign(x[0]) || 1, 0, 0, 0, Math.sign(x[1]) || 1, 0, 0, 0, Math.sign(x[2]) || 1], M);
+        margin = Math.min(margin,
+          Math.abs(x[0] - FO[0]), Math.abs(x[1] - FO[1]), Math.abs(x[2] - FO[2]));
+        M = V.mMul([Math.sign(x[0] - FO[0]) || 1, 0, 0, 0, Math.sign(x[1] - FO[1]) || 1, 0, 0, 0, Math.sign(x[2] - FO[2]) || 1], M);
       }
-      x = [Math.abs(x[0]), Math.abs(x[1]), Math.abs(x[2])];
+      x = [FO[0] + Math.abs(x[0] - FO[0]), FO[1] + Math.abs(x[1] - FO[1]), FO[2] + Math.abs(x[2] - FO[2])];
       if (rec) margin = Math.min(margin, Math.abs(x[0] - x[1]) / SQ2);
       if (x[0] < x[1]) { const t = x[0]; x[0] = x[1]; x[1] = t; if (rec) M = V.mMul([0,1,0, 1,0,0, 0,0,1], M); }
       if (rec) margin = Math.min(margin, Math.abs(x[1] - x[2]) / SQ2);
@@ -173,14 +182,18 @@
     const S = P.style;
     let cands = [];
     if (S === LG.STYLE_MENGER || S === LG.STYLE_OCTA) {
-      // preimages live among the signed permutations of w (validated below)
+      // Preimages: undo the sorts (all permutations of w), then undo the
+      // offset abs per component (v_i = a_i or its reflection 2*o_i - a_i).
+      // Branch enumeration, NOT a group orbit — which is why offset (non-
+      // concurrent) planes are fine for these styles. Validated below.
+      const FO = P.foldOff || [0, 0, 0];
       const perms = [[0,1,2],[0,2,1],[1,0,2],[1,2,0],[2,0,1],[2,1,0]];
       for (const pm of perms)
         for (let sg = 0; sg < 8; sg++)
           cands.push([
-            (sg & 1 ? -1 : 1) * w[pm[0]],
-            (sg & 2 ? -1 : 1) * w[pm[1]],
-            (sg & 4 ? -1 : 1) * w[pm[2]],
+            sg & 1 ? 2 * FO[0] - w[pm[0]] : w[pm[0]],
+            sg & 2 ? 2 * FO[1] - w[pm[1]] : w[pm[1]],
+            sg & 4 ? 2 * FO[2] - w[pm[2]] : w[pm[2]],
           ]);
     } else {
       // POLY / ICOSA: BFS orbit of w under the style's mirror generators
@@ -390,7 +403,10 @@
       for (let j = Math.max(0, this.K - this.outer.length); j <= this.K + N_INNER; j++) {
         const P = this.params(j);
         const t = Math.hypot(P.trans[0], P.trans[1], P.trans[2]);
-        bound = Math.max(bound, t / (P.scale - 1));
+        // offset folds displace by up to 2|o| before scaling: |Fold(x)| <=
+        // s*(|x| + 2|o|) + |t|, so the invariant ball grows accordingly
+        const fo = P.foldOff ? Math.hypot(P.foldOff[0], P.foldOff[1], P.foldOff[2]) : 0;
+        bound = Math.max(bound, (t + 2 * P.scale * fo) / (P.scale - 1));
       }
       this.bound = bound * 1.05;
       return true;
@@ -594,8 +610,8 @@
     /* ---- GPU upload ------------------------------------------------------- */
     /* UBO layout (std140, all vec4):
          vec4 lvl[SLOTS*6]  — per level slot: rotCol0(w=scale), rotCol1(w=style),
-                              rotCol2(w=foldL), trans(w=emissive), pal(w=margin*),
-                              spare — see packUBO for exact packing
+                              rotCol2(w=foldL), trans(w=emissive), pal,
+                              foldOff — see packUBO for exact packing
          vec4 outer[B_HARD*4] — per outer slot: jacCol0, jacCol1, jacCol2, (c.xyz, margin)
        Slot i covers absolute level (K - Beff + i).                            */
     packUBO(buf) {
@@ -611,7 +627,8 @@
         f[o + 8] = rc[6]; f[o + 9] = rc[7]; f[o + 10] = rc[8]; f[o + 11] = P.foldL;
         f[o + 12] = P.trans[0]; f[o + 13] = P.trans[1]; f[o + 14] = P.trans[2]; f[o + 15] = P.emissive;
         f[o + 16] = P.pal[0]; f[o + 17] = P.pal[1]; f[o + 18] = P.pal[2]; f[o + 19] = 0;
-        f[o + 20] = 0; f[o + 21] = 0; f[o + 22] = 0; f[o + 23] = 0;
+        const FO = P.foldOff || [0, 0, 0];
+        f[o + 20] = FO[0]; f[o + 21] = FO[1]; f[o + 22] = FO[2]; f[o + 23] = 0;
       }
       const base = SLOTS * 6 * 4;
       for (let b = 0; b < B_HARD; b++) {
@@ -703,10 +720,22 @@
         const a = L.fadeDur
           ? Math.min(1, Math.max(0, (this.timeSec - L.spawnT) / L.fadeDur)) : 1;
         const eff = L.intensity * fade * (a * a * (3 - 2 * a));
-        return { L, eff, s: (eff / (d * d)) * Math.exp(-d * 1.2e-4) };
+        return { L, eff, s: (eff / (d * d)) * Math.exp(-d * 1.2e-4 * this.fogMul) };
       });
       scored.sort((a, b) => b.s - a.s);
-      return scored.slice(0, MAX_LIGHTS_GPU).map((x) => ({ ...x.L, intensity: x.eff }));
+      // STICKY selection + ordering: only the top MAX_LIGHTS_GPU fit on the
+      // GPU, and slots 0-1 cast shadows. Re-picking by raw score every frame
+      // made lights (and their shadows) pop whenever two scores crossed, so
+      // incumbents keep their place unless a challenger beats them by 35%.
+      const sticky = new Set(this._gpuSel || []);
+      const stickyTop = new Set(this._gpuTop || []);
+      const rank = (x, set) => x.s * (set.has(x.L) ? 1.35 : 1);
+      scored.sort((a, b) => rank(b, sticky) - rank(a, sticky));
+      const sel = scored.slice(0, MAX_LIGHTS_GPU);
+      sel.sort((a, b) => rank(b, stickyTop) - rank(a, stickyTop));
+      this._gpuSel = sel.map((x) => x.L);
+      this._gpuTop = sel.slice(0, 2).map((x) => x.L);
+      return sel.map((x) => ({ ...x.L, intensity: x.eff }));
     }
   }
 

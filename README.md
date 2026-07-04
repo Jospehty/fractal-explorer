@@ -64,10 +64,15 @@ Everything worth knowing about the math lives in a long header comment in
   `js/levelgen.js`. Levels are grouped into biomes that share stylistic
   biases. Four fold styles: POLY (crystalline), MENGER (architectural),
   OCTA (canyons) and ICOSA (the icosahedral H3 kaleidoscope — rounded,
-  organic, smooth surfaces). Every fold op must be a mirror of a FINITE
-  reflection group or rebasing stops being seamless; that rules out curved
-  maps (sphere folds, Mandelbulb powers) but higher-order kaleidoscopes are
-  fair game.
+  organic, smooth surfaces). MENGER and OCTA additionally use OFFSET fold
+  planes (the Mandelbox box-fold trick): per-biome offset directions with
+  magnitudes that glide with depth, so copies stop meeting corner-on-corner
+  and the terrain gets swooping, layered, asymmetric structure. Every fold
+  op must still be a pure reflection: offsets are fine for styles whose
+  preimages enumerate branch choices (MENGER/OCTA), but styles that walk a
+  group orbit (POLY/ICOSA) need concurrent planes. Curved maps (sphere
+  folds, Mandelbulb powers) are ruled out entirely — they break the outer
+  window's piecewise-linear transport.
 - Movement speed and fog density are tied to a per-level sawtooth (`fogMul`)
   that is rescaled by exactly `1/s` at each rebase, so apparent speed and
   optical depth are continuous while zooming in AND out.

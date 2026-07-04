@@ -121,6 +121,11 @@
       // light only mean something next to real darkness.
       lightMode: r(21) < 0.3 ? 0 : r(21) < 0.72 ? 1 : 2,
       valBase: 0.38 + r(22) * 0.3,       // palette value anchor (smoothed per level)
+      // Offset fold planes (MENGER/OCTA only — see world.js evalFold): the
+      // direction is a biome trait, the magnitude drifts per level. Band
+      // validated via stylecheck: solid through 0.4*(s-1), eroding beyond.
+      foldOffDir: V.norm([r(24) * 2 - 1, r(25) * 2 - 1, r(26) * 2 - 1]),
+      foldOffMax: r(27) * 0.38,
     };
   }
 
@@ -148,11 +153,14 @@
       const s = o.scale && !o.alt ? o.scale : (anchor.lo + anchor.hi) / 2;
       const k = (s - 1) * (o.spread || 1);
       const rot = twist ? V.mAxisAngle(V.norm([0.3, 0.9, 0.2]), twist) : V.mIdent();
+      const foDir = V.norm([0.55, 0.8, 0.25]);
+      const foMag = (o.foldoff || 0) * (s - 1);
       return {
         level: j, zone: 0, biome: biomeParams(seed, 0),
         style, scale: s, rot,
         trans: [-k * anchor.pull[0] * pullMod[0], -k * anchor.pull[1] * pullMod[1], -k * anchor.pull[2] * pullMod[2]],
         foldL: 1,
+        foldOff: [foDir[0] * foMag, foDir[1] * foMag, foDir[2] * foMag],
         pal: hsv(0.55 + 0.06 * (j % 4) + zone5 * 0.3, 0.5, 0.75), emissive: 0,
         light: { spawn: false, col: [1, 1, 1], off: [0, 0, 0], intensity: 0 },
       };
@@ -162,7 +170,7 @@
       return {
         level: j, zone: 0, biome: biomeParams(seed, 0),
         style: STYLE_MENGER, scale: 3, rot: V.mIdent(),
-        trans: [-2, -2, -1], foldL: 1,
+        trans: [-2, -2, -1], foldL: 1, foldOff: [0, 0, 0],
         pal: hsv(0.08 + 0.02 * (j % 5), 0.5, 0.8), emissive: 0,
         light: { spawn: j % 3 === 0, col: hsv(0.6, 0.6, 1), off: [0.5, 0.5, 0], intensity: 3 },
       };
@@ -191,6 +199,17 @@
     const pull = biome.anchor.pull;
     const foldL = 1.0;
     const trans = [-k * pull[0], -k * pull[1], -k * pull[2]];
+
+    // Offset fold planes: magnitude glides with zone position (like the
+    // palette tracks) so the structural character morphs smoothly with depth
+    const zlenO = Math.max(1, zone.end - zone.start);
+    const ztO = (j - zone.start) / zlenO;
+    const foMag = (style === STYLE_MENGER || style === STYLE_OCTA)
+      ? biome.foldOffMax * (0.35 + 0.65 * Math.sin(ztO * 3.14159)) * (scale - 1)
+      : 0;
+    const foldOff = foMag
+      ? [biome.foldOffDir[0] * foMag, biome.foldOffDir[1] * foMag, biome.foldOffDir[2] * foMag]
+      : [0, 0, 0];
 
     // Palette: hue/sat/value tracks are CONTINUOUS across the whole dive.
     // Within a zone they glide along the biome's anchor; at zone edges they
@@ -230,7 +249,7 @@
     const lightInt = 0.08 + r(26) * 0.18;
 
     return {
-      level: j, zone: zone.index, biome, style, scale, rot, trans, foldL,
+      level: j, zone: zone.index, biome, style, scale, rot, trans, foldL, foldOff,
       pal, emissive,
       light: { spawn: lightSpawn, col: lightCol, off: lightOff, intensity: lightInt },
     };
