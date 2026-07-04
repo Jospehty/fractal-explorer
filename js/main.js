@@ -99,7 +99,19 @@
     paused: false,
     sunCol: [1.0, 0.93, 0.82],
     deCam: world.de(world.camPos),
+    lightColIdx: 0,
   };
+
+  // manual light palette (C cycles, L drops); 'auto' = current level's color
+  const LIGHT_COLORS = [
+    ['auto', null],
+    ['warm', [1.0, 0.78, 0.5]],
+    ['cold', [0.55, 0.75, 1.0]],
+    ['ember', [1.0, 0.42, 0.25]],
+    ['emerald', [0.4, 1.0, 0.55]],
+    ['violet', [0.75, 0.5, 1.0]],
+    ['white', [1, 1, 1]],
+  ];
 
   let msgTimer = null;
   function flashMsg(text) {
@@ -120,7 +132,22 @@
     if (what === 'q0') state.quality = 0;
     if (what === 'q1') state.quality = 1;
     if (what === 'q2') state.quality = 2;
-    if (what === 'light') { world.addUserLight(cam.forward); flashMsg('light dropped'); }
+    if (what === 'light') {
+      const c = LIGHT_COLORS[state.lightColIdx];
+      world.addUserLight(cam.forward, c[1]);
+      flashMsg('light dropped (' + c[0] + ')');
+    }
+    if (what === 'lightcolor') {
+      state.lightColIdx = (state.lightColIdx + 1) % LIGHT_COLORS.length;
+      flashMsg('light color: ' + LIGHT_COLORS[state.lightColIdx][0]);
+    }
+    if (what === 'autolights') {
+      world.autoLights = !world.autoLights;
+      flashMsg('auto lights ' + (world.autoLights ? 'on' : 'off'));
+    }
+    if (what === 'removelight') {
+      flashMsg(world.removeNearestLight() ? 'light removed' : 'no lights to remove');
+    }
     if (what === 'newseed') {
       location.href = location.pathname + '?seed=' + ((Math.random() * 0xffffffff) >>> 0);
     }
@@ -257,6 +284,8 @@
 
     // rebase to keep camera-local numbers O(1); rotate the view basis along
     state.deCam = world.rebaseToCamera();
+    world.tick(dt);
+    world.updateFog(state.deCam, dt);
     const R = world.takeFrameRotation();
     const rotApplied =
       R[0] !== 1 || R[4] !== 1 || R[8] !== 1 ||
@@ -303,7 +332,9 @@
         for (let i = 0; i < n; i++) {
           state.deCam = world.de(world.camPos);
           autopilot(1 / 60);
-          world.rebaseToCamera();
+          state.deCam = world.rebaseToCamera();
+          world.tick(1 / 60);
+          world.updateFog(state.deCam, 1 / 60);
           const R = world.takeFrameRotation();
           const detR =
             R[0] * (R[4] * R[8] - R[5] * R[7]) -

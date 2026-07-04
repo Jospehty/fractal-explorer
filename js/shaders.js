@@ -46,6 +46,10 @@
   uniform float uGlowAmt;
   uniform float uBound;
   uniform vec2  uJitter;     // sub-pixel jitter for still-frame accumulation
+  uniform float uFogMul;     // fog continuity multiplier (world.fogMul): scales
+                             // fog density up / march limit down as the camera
+                             // progresses through a level, so optical depth is
+                             // continuous across the rebase rescale
 
   layout(std140) uniform Params {
     vec4 lvl[SLOTS * 6];        // per slot: rot0(w=scale) rot1(w=style) rot2(w=foldL) trans(w=emissive) pal spare
@@ -227,7 +231,8 @@
     vec3 rd = normalize(uCamBasis * vec3(uv * uFovTan, 1.0));
     vec3 ro = vec3(0.0);                             // camera at origin of frame K
 
-    const float TMAX = 6.0e4;
+    const float TMAX = 2.4e5;
+    float tmax = TMAX / uFogMul; // effective horizon, continuous across rebases
     int   MAXSTEP = uQuality == 0 ? 100 : (uQuality == 1 ? 150 : 210);
     float t = 0.0;
     float d = 0.0;
@@ -237,13 +242,13 @@
     bool exhausted = false;
     int steps = 0;
     for (int i = 0; i < 256; i++) {
-      if (t > TMAX) break;
+      if (t > tmax) break;
       if (i >= MAXSTEP) { hit = true; exhausted = true; break; } // grazing geometry
       steps = i;
       vec3 p = ro + rd * t;
       d = map(p, t * pix * 0.22, trap, trapPl);
       if (d < t * pix * 0.45 + 2e-6) { hit = true; break; }
-      t += min(d, TMAX * 0.5) * 0.92;
+      t += min(d, tmax * 0.5) * 0.92;
     }
     ${global.__SHADER_DEBUG === 'stats'
       ? `fragColor = vec4(clamp(log2(t + 1.0) / 15.0, 0.0, 1.0),
@@ -255,7 +260,7 @@
       : ''}
     vec3 col;
     vec3 dbgLights = vec3(0.0);
-    float fogT = min(t, TMAX);
+    float fogT = min(t, tmax);
     if (hit) {
       vec3 p = ro + rd * t;
       float coneEps = t * pix * 0.22;
@@ -300,22 +305,26 @@
       col += alb * (0.22 * head * head * ao / (1.0 + t * t * 0.20));
 
       vec3 dbgBase = col;
-      // point lights
+      // point lights: POOLS, not floodlights — the clamp is well below sun
+      // strength, so a light can never fullbright its surroundings; it reads
+      // as a hot pool near the source falling off into darkness
+      int lshN = uQuality >= 2 ? 2 : (uQuality >= 1 ? 1 : 0); // lights that cast shadows
       for (int li = 0; li < MAX_LIGHTS; li++) {
         if (li >= uLightN) break;
         vec3 lp = uLightPos[li].xyz;
         float rad = uLightPos[li].w;
         vec3 lv = lp - p;
         float dist2 = dot(lv, lv);
-        // fog extinction keeps receding giant suns from stacking overexposure;
-        // the clamp bounds worst-case contribution of a light hugging a wall
-        float atten = min(uLightCol[li].w / (dist2 + rad * rad), 0.9) * exp(-sqrt(dist2) * 2.5e-4);
+        // fog extinction keeps receding giant suns from stacking overexposure
+        float atten = min(uLightCol[li].w / (dist2 + rad * rad), 0.5) * exp(-sqrt(dist2) * 1.2e-4);
         if (atten < 0.002) continue;
         vec3 ld = lv * inversesqrt(dist2);
         float diff = max(dot(n, ld), 0.0);
         float lsh = 1.0;
-        if (uQuality >= 2 && li == 0 && diff * atten > 0.02) {
-          lsh = softShadow(p + n * eps * 3.0, ld, eps * 8.0, sqrt(dist2), 10.0, coneEps, 32);
+        // light shadows are what make the pools cascade across the geometry
+        if (li < lshN && diff * atten > 0.02) {
+          lsh = softShadow(p + n * eps * 3.0, ld, eps * 8.0, sqrt(dist2), 10.0, coneEps,
+                           uQuality >= 2 ? 32 : 20);
         }
         float lspec = pow(max(dot(n, normalize(ld - rd)), 0.0), 30.0) * 0.5;
         col += uLightCol[li].rgb * (diff + lspec) * atten * lsh;
@@ -332,18 +341,22 @@
       dbgLights = col - dbgBase;
     } else {
       col = skyColor(rd);
-      t = TMAX;
+      t = tmax;
     }
 
-    // distance fog toward mood color (keeps giant vistas readable). Constants
-    // are softer than the far plane needs, so distant structure stays visible
-    // for most of the range...
-    float fog = 1.0 - exp(-fogT * 4.5e-5);
-    if (exhausted) fog = max(fog, 0.5); // soften silhouette-grazing speckle
-    fog = mix(fog, 1.0 - exp(-fogT * 1.8e-5), 0.5);
-    // ...and this guarantees FULL fog before TMAX, so the farthest vistas fade
-    // into the haze instead of popping out of existence at the far plane.
-    fog = max(fog, smoothstep(0.55 * TMAX, 0.92 * TMAX, fogT));
+    // distance fog toward mood color (keeps giant vistas readable). The air
+    // is deliberately clear: most of the horizon work is done by the fade
+    // below, so distant structure stays visible across most of the range.
+    // All densities scale with uFogMul (continuity across rebases).
+    float fog = 1.0 - exp(-fogT * 1.2e-5 * uFogMul);
+    fog = mix(fog, 1.0 - exp(-fogT * 5.0e-6 * uFogMul), 0.5);
+    // step-exhausted rays get softened toward fog ONLY at range: grazing
+    // silhouettes at distance lose their speckle, while tight caves near the
+    // camera stay DARK instead of being brightened toward the sky color
+    if (exhausted) fog = max(fog, min(0.5, fogT / (tmax * 0.15)));
+    // guarantee FULL fog before tmax, so the farthest vistas fade into the
+    // haze instead of popping out of existence at the far plane
+    fog = max(fog, smoothstep(0.55 * tmax, 0.92 * tmax, fogT));
     vec3 fogCol = mix(uFogCol, skyColor(rd), 0.35);
     col = mix(col, fogCol, hit ? fog : fog * 0.25);
 
@@ -354,7 +367,7 @@
     for (int li = 0; li < MAX_LIGHTS; li++) {
       if (li >= uLightN) break;
       float sc = inscatter(ro, rd, uLightPos[li].xyz, fogT);
-      float ext = exp(-length(uLightPos[li].xyz) * 2.5e-4); // fog extinction of the glow
+      float ext = exp(-length(uLightPos[li].xyz) * 1.2e-4); // fog extinction of the glow
       // tight orb profile: the raw 1/h scatter is too broad and washes the
       // whole frame; sc^2/(1+sc/2) keeps a hot core with negligible skirt
       float orb = uLightCol[li].w * sc * sc * 0.013 / (1.0 + 0.5 * sc);

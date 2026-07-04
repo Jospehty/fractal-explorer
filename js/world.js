@@ -54,13 +54,16 @@
      old fold plane. */
   const B_MIN = 8;
   const B_HARD = 24;
-  /* The renderer marches to TMAX = 6e4 but guarantees FULL fog by 0.92*TMAX
-     = 5.5e4 (see the horizon fade in shaders.js), so geometry changes beyond
-     2*HORIZON = 6e4 are invisible. Do NOT raise HORIZON without re-validating
-     test/world.test.js: a larger outer window increases fold-boundary
-     double-crossings when transporting near-camera points across rebases
-     (the test's outlier budget) and erodes far-field f32 accuracy. */
-  const HORIZON = 3.0e4;
+  /* Coupled to the renderer: the shader marches to tmax = TMAX/fogMul with
+     TMAX = 2.4e5 and fogMul >= 0.85, and guarantees FULL fog by 0.92*tmax
+     (horizon fade in shaders.js) — so the farthest visible geometry is at
+     0.92 * 2.4e5 / 0.85 = 2.6e5 <= 2*HORIZON, and dropping an outer level is
+     never visible. Raising HORIZON further trades test guarantees for range:
+     a larger outer window increases fold-boundary double-crossings when
+     transporting near-camera points across rebases (the outlier budget in
+     test/world.test.js) and grows far-field f32 error (still sub-angular —
+     see the tolerance model there — but re-validate before touching this). */
+  const HORIZON = 1.35e5;
   const N_INNER = 16;     // inner detail levels
   const SLOTS = B_HARD + N_INNER;
   const ESCAPE2 = 900.0;  // escape radius^2 for the orbit
@@ -208,7 +211,17 @@
       this.sunDir = V.norm([0.55, 0.75, 0.35]);
       this.lights = [];                     // {pos (frame K), col, radius, intensity, level}
       this._litLevels = new Set();          // levels that already spawned their light (never respawn)
+      this.autoLights = true;               // O key: disable to place lights manually only
+      this.timeSec = 0;                     // world clock (advanced by tick) for light fade-ins
       this.pendingRot = V.mIdent();         // accumulated frame rotation for the renderer's camera basis
+      /* Fog continuity multiplier. Fog density and the march limit live in
+         frame-K units, but every rebase rescales those units by s — with
+         fixed constants the whole fog field visibly thickened at each zoom
+         step. fogMul makes optical depth CONTINUOUS: it relaxes toward s^f
+         (f = fractional progress through the level, 0 after a rebase, 1 at
+         the next), and descend/ascend rescale it by exactly 1/s / s — the
+         same jump the frame distances make, so k*t never jumps. */
+      this.fogMul = 1;
       this._pcache = new Map();
       this.updateChain();
     }
@@ -365,6 +378,7 @@
       this.camPos = r.x;
       this.K++;
       this.log10Zoom += Math.log10(s);
+      this.fogMul /= s; // distances just grew by s: keep optical depth continuous
       this._spawnLight();
       this._pruneLights();
       this.updateChain();
@@ -393,6 +407,7 @@
       this.camPos = pre;
       this.K--;
       this.log10Zoom -= Math.log10(s);
+      this.fogMul *= s; // distances just shrank by s: keep optical depth continuous
       this._pruneLights();
       this.updateChain();
       return true;
@@ -426,6 +441,7 @@
 
     /* ---- lights ---------------------------------------------------------- */
     _spawnLight() {
+      if (!this.autoLights) return; // O key: manual placement only
       const P = this.params(this.K);
       if (!P.light.spawn) return;
       // A level spawns its light at most ONCE per session. Checking the live
@@ -434,31 +450,62 @@
       // copies until the frame washed out.
       if (this._litLevels.has(this.K)) return;
       this._litLevels.add(this.K);
-      const g = this.grad(this.camPos);
-      const o = P.light.off;
-      const pos = V.add(this.camPos, V.add(V.scale(g, 0.9), V.scale(o, 0.9)));
+      // Wall-hugging placement: probe deterministic directions and prefer a
+      // spot NEAR geometry a few units out. The light reads as a pool on a
+      // structure you can travel toward — grazing walls, casting shadows,
+      // glimpsed around corners — instead of a lamp floating beside the
+      // camera that floodlights everything the moment the level rebases.
+      const R = (salt) => LG.rnd(this.seed, this.K, salt);
+      let best = null, bestScore = -Infinity;
+      for (let i = 0; i < 10; i++) {
+        const dir = V.norm([R(60 + i * 4) * 2 - 1, R(61 + i * 4) * 2 - 1, R(62 + i * 4) * 2 - 1]);
+        const dist = 1.5 + R(63 + i * 4) * 4.0;
+        const p = V.add(this.camPos, V.scale(dir, dist));
+        const d = this.de(p);
+        if (d < 0.03) continue; // inside or embedded in a wall
+        // ~0.3 off a wall is the sweet spot; mild preference for nearer spots
+        const score = -Math.abs(d - 0.3) - dist * 0.03;
+        if (score > bestScore) { bestScore = score; best = p; }
+      }
+      const pos = best ||
+        V.add(this.camPos, V.add(V.scale(this.grad(this.camPos), 0.9), V.scale(P.light.off, 0.9)));
       this.lights.push({
-        pos, col: P.light.col, radius: 0.035, intensity: P.light.intensity,
+        pos, col: P.light.col, radius: 0.05, intensity: P.light.intensity,
         level: this.K, spawnZoom: this.log10Zoom,
+        spawnT: this.timeSec, fadeDur: 3.0, // grow in gently — never pop at a rebase
       });
     }
 
     /* Manual light drop (L key). Placed just ahead of the camera in frame-K
        units, so it is automatically sized to the current zoom scale and is
-       carried through rebases like any spawned light. */
+       carried through rebases like any spawned light. col overrides the
+       level's palette color (C key cycles the choice in main.js). */
     addUserLight(forward, col) {
       const de = Math.max(Math.abs(this.de(this.camPos)), 0.005);
       const pos = V.add(this.camPos, V.scale(forward, Math.min(de * 2.0, 0.12) + 0.02));
       this.lights.push({
-        pos, col: col || this.params(this.K).light.col, radius: 0.02, intensity: 0.12,
-        level: this.K, spawnZoom: this.log10Zoom,
+        pos, col: col || this.params(this.K).light.col, radius: 0.02, intensity: 0.14,
+        level: this.K, spawnZoom: this.log10Zoom, spawnT: this.timeSec, fadeDur: 0.5,
       });
       this._pruneLights();
     }
+
+    /* Remove the light nearest to the camera (X key). Returns false if none. */
+    removeNearestLight() {
+      if (!this.lights.length) return false;
+      let bi = 0, bd = Infinity;
+      for (let i = 0; i < this.lights.length; i++) {
+        const d = V.dist(this.lights[i].pos, this.camPos);
+        if (d < bd) { bd = d; bi = i; }
+      }
+      this.lights.splice(bi, 1);
+      return true;
+    }
+
     _pruneLights() {
-      // beyond ~1e4 units the fog extinction makes a light invisible
+      // beyond ~4e4 units the fog extinction makes a light invisible
       this.lights = this.lights.filter(
-        (L) => L.radius > 2e-4 && L.radius < 1.5e4 && V.dist(L.pos, this.camPos) < 2.5e4
+        (L) => L.radius > 2e-4 && L.radius < 4e4 && V.dist(L.pos, this.camPos) < 6e4
       );
       if (this.lights.length > MAX_LIGHTS_STORED)
         this.lights.splice(0, this.lights.length - MAX_LIGHTS_STORED);
@@ -503,20 +550,55 @@
       return f;
     }
 
+    /* Advance the world clock (light fade-ins). Called once per frame, and by
+       the deterministic test driver, so fades work identically in DET mode. */
+    tick(dt) {
+      this.timeSec += dt;
+    }
+
+    /* Per-frame fog relaxation: chase s^f (see fogMul in the constructor).
+       The rebase rescales (descend/ascend) preserve continuity EXACTLY; this
+       EMA only absorbs the drift between levels of different scale and the
+       ascend hysteresis, both of which resolve smoothly over ~a second. */
+    updateFog(deCam, dt) {
+      const sK = this.params(this.K).scale;
+      const de = Math.max(deCam || DESCEND_DE * sK, 1e-12);
+      const f = Math.min(1, Math.max(0, Math.log((DESCEND_DE * sK) / de) / Math.log(sK)));
+      const target = Math.pow(sK, f);
+      this.fogMul += (target - this.fogMul) * (1 - Math.exp(-(dt || 0.016) * 2.5));
+      // floor 0.85: the level-drop-invisibility bound (see HORIZON) assumes
+      // the effective march limit never exceeds TMAX/0.85
+      this.fogMul = Math.min(Math.max(this.fogMul, 0.85), sK * 1.6);
+    }
+
     /* Sky/fog mood, CONTINUOUS in depth: K plus fractional progress through
        the level inferred from the camera's DE (descend fires at DESCEND_DE,
        right after which DE ≈ DESCEND_DE * s). Discrete-K moods pop at every
-       rebase. */
-    mood(deCam) {
+       rebase. f is deliberately unclamped: it stays continuous through the
+       ascend hysteresis band. */
+    _depthD(deCam) {
       const sK = this.params(this.K).scale;
       const de = Math.max(deCam || DESCEND_DE * sK, 1e-12);
-      const f = Math.log((DESCEND_DE * sK) / de) / Math.log(sK);
-      const D = this.K + f;
+      return this.K + Math.log((DESCEND_DE * sK) / de) / Math.log(sK);
+    }
+    _moodAt(D) {
       const j0 = Math.max(0, Math.floor(D));
       const fr = Math.min(1, Math.max(0, D - j0));
       const a = this.params(j0).biome;
       const b = this.params(j0 + 1).biome;
       return { sky: V.lerp(a.sky, b.sky, fr), fog: V.lerp(a.fog, b.fog, fr) };
+    }
+    mood(deCam) {
+      // Average three samples along the depth track: biome (zone) changes
+      // spread over ~2.5 levels of zoom instead of stepping within one.
+      const D = this._depthD(deCam);
+      const a = this._moodAt(D - 0.8), b = this._moodAt(D), c = this._moodAt(D + 0.8);
+      const avg = (k) => [
+        (a[k][0] + b[k][0] + c[k][0]) / 3,
+        (a[k][1] + b[k][1] + c[k][1]) / 3,
+        (a[k][2] + b[k][2] + c[k][2]) / 3,
+      ];
+      return { sky: avg('sky'), fog: avg('fog') };
     }
 
     /* Continuous depth in log10 units (K progress inferred from camera DE),
@@ -533,11 +615,15 @@
       const Z = this.depthZoom(deCam);
       const scored = this.lights.map((L) => {
         const d = Math.max(V.dist(L.pos, this.camPos), L.radius);
-        // age fade: apparent brightness ~ (total zoom growth since spawn)^-0.8,
-        // continuous in depth so rebases never blink
-        const fade = Math.pow(10, -0.8 * Math.max(0, Z - L.spawnZoom));
-        const eff = L.intensity * fade;
-        return { L, eff, s: (eff / (d * d)) * Math.exp(-d * 2.5e-4) };
+        // age fade: apparent brightness ~ (total zoom growth since spawn)^-1.1,
+        // continuous in depth so rebases never blink; steep enough that lights
+        // from levels you've left become glimmers, not ambient fill
+        const fade = Math.pow(10, -1.1 * Math.max(0, Z - L.spawnZoom));
+        // time fade-in after spawn (smoothstep) — no insta-illumination
+        const a = L.fadeDur
+          ? Math.min(1, Math.max(0, (this.timeSec - L.spawnT) / L.fadeDur)) : 1;
+        const eff = L.intensity * fade * (a * a * (3 - 2 * a));
+        return { L, eff, s: (eff / (d * d)) * Math.exp(-d * 1.2e-4) };
       });
       scored.sort((a, b) => b.s - a.s);
       return scored.slice(0, MAX_LIGHTS_GPU).map((x) => ({ ...x.L, intensity: x.eff }));

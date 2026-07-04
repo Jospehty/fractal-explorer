@@ -37,6 +37,9 @@ Install the **Live Server** extension, right-click `index.html`, and select
 | scroll | speed — the *only* speed control; rebasing carries it across zoom levels so ×1 always feels the same relative to nearby terrain |
 | Q / E | roll |
 | L | drop a point light just ahead of you, sized to your current scale (for dark interiors) |
+| C | cycle the manual light color (auto / warm / cold / ember / emerald / violet / white) |
+| O | toggle automatic light spawning (off = fully manual lighting) |
+| X | remove the light nearest to you |
 | F | autopilot dive |
 | G | toggle light glow |
 | 1 / 2 / 3 | render quality (soft shadows, light shadows) |
@@ -68,8 +71,15 @@ Everything worth knowing about the math lives in a long header comment in
   validates them against each other bit-for-bit.
 - Point lights are world objects in frame-`K` coordinates; rebasing rescales
   radius (×s) and intensity (×s²) so lighting is scale-invariant. Each level
-  spawns its light at most once per session, lights fade with zoom age, and
-  the mood aims dark: sparse pools of light, deep shadow, emissive veins.
+  spawns its light at most once per session; lights fade IN over a few seconds
+  (no pop at the rebase that spawns them), sit against walls a few units out
+  (pools and cascading shadows, not camera floodlights), fade with zoom age,
+  and some biomes spawn none at all. The mood aims dark: pools of light only
+  mean something next to real darkness. `O/L/C/X` give full manual control.
+- Fog is continuous across rebases: density and the march horizon live in
+  frame units, which rescale by `s` at every rebase, so a `fogMul` state
+  ramps within each level and is rescaled by exactly `1/s` at descend — the
+  optical depth along any ray never jumps (`updateFog` in `world.js`).
 
 ## Development
 
@@ -120,6 +130,8 @@ debug views · `?style=0|1|2` force a fold style · `?canon=1` canonical Menger.
 - Scale/translation anchors in `levelgen.js` are held exactly at per-style
   connectivity bands; even ±2% per-level jitter erodes the attractor to dust.
 - `HORIZON` (world.js) and `TMAX` + the horizon fade (shaders.js) are coupled:
-  full fog must be reached before `2*HORIZON` so dropping an outer level is
-  never visible, and enlarging the outer window degrades the rebase-transport
-  outlier budget in the tests.
+  the effective march limit is `TMAX / fogMul` with `fogMul >= 0.85`, and full
+  fog must be reached before `2*HORIZON` so dropping an outer level is never
+  visible (`0.92 * TMAX / 0.85 <= 2*HORIZON`). Enlarging the outer window
+  further degrades the rebase-transport outlier budget in the tests — the
+  major-outlier tier there was calibrated against the current values.

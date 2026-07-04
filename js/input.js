@@ -40,15 +40,18 @@
       });
       document.addEventListener('mousemove', (e) => {
         if (!this.pointerLocked && !this.isDragging) return;
-        this.yawDelta += e.movementX * 0.0021;
-        this.pitchDelta += e.movementY * 0.0021;
+        // negative: positive rotation about cam.up/right turns the view
+        // left/up, so FPS convention (mouse right => look right) needs the flip
+        this.yawDelta -= e.movementX * 0.0021;
+        this.pitchDelta -= e.movementY * 0.0021;
       });
       document.addEventListener('keydown', (e) => {
         if (e.repeat) return;
         this.keys.add(e.code);
         const map = {
           KeyF: 'auto', KeyH: 'help', KeyP: 'pause', KeyN: 'newseed',
-          Digit1: 'q0', Digit2: 'q1', Digit3: 'q2', KeyG: 'glow', KeyL: 'light',
+          Digit1: 'q0', Digit2: 'q1', Digit3: 'q2', KeyG: 'glow',
+          KeyL: 'light', KeyO: 'autolights', KeyC: 'lightcolor', KeyX: 'removelight',
         };
         if (map[e.code]) this.onToggle(map[e.code]);
       });
@@ -81,8 +84,8 @@
           const t = e.changedTouches[0];
           const prev = touches.get(t.identifier);
           if (prev) {
-            this.yawDelta += (t.clientX - prev.x) * 0.004;
-            this.pitchDelta += (t.clientY - prev.y) * 0.004;
+            this.yawDelta -= (t.clientX - prev.x) * 0.004;
+            this.pitchDelta -= (t.clientY - prev.y) * 0.004;
             touches.set(t.identifier, { x: t.clientX, y: t.clientY });
           }
         } else if (touches.size >= 2) {

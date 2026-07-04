@@ -111,7 +111,18 @@
       fog: hsv(hue + 0.5 + (r(11) - 0.5) * 0.2, 0.45 + r(12) * 0.35, 0.09 + r(13) * 0.2),
       sky: hsv(hue + 0.45 + (r(14) - 0.5) * 0.3, 0.4 + r(15) * 0.4, 0.2 + r(16) * 0.35),
       lightHue: hue + 0.33 + r(17) * 0.34,
+      // 0 = dark biome (no auto lights — sun, veins and the headlight carry
+      // it), 1 = sparse, 2 = lit. Dark stretches are the point: pools of
+      // light only mean something next to real darkness.
+      lightMode: r(21) < 0.3 ? 0 : r(21) < 0.72 ? 1 : 2,
+      valBase: 0.38 + r(22) * 0.3,       // palette value anchor (smoothed per level)
     };
+  }
+
+  // shortest-arc hue interpolation (hue is circular in [0,1))
+  function mixHue(a, b, t) {
+    const d = ((b - a + 0.5) % 1 + 1) % 1 - 0.5;
+    return a + d * t;
   }
 
   // Full parameter record for one absolute level j (j >= 0).
@@ -176,24 +187,40 @@
     const foldL = 1.0;
     const trans = [-k * pull[0], -k * pull[1], -k * pull[2]];
 
-    // Palette: hue/sat/value drift SMOOTHLY with depth across the zone
-    // (independent per-level jitter made adjacent levels' surface colors jump;
-    // combined with the shader's trap crossfade this gives gradual gradients).
+    // Palette: hue/sat/value tracks are CONTINUOUS across the whole dive.
+    // Within a zone they glide along the biome's anchor; at zone edges they
+    // pass through the midpoint with the neighbouring zone's anchor, so
+    // biome changes are gradients too, never steps. (Independent per-level
+    // jitter — the original scheme — made adjacent levels' colors jump.)
+    const bPrev = biomeParams(seed, Math.max(0, zone.index - 1));
+    const bNext = biomeParams(seed, zone.index + 1);
     const zlen = Math.max(1, zone.end - zone.start);
     const zt = (j - zone.start) / zlen; // 0..1 position within the zone
-    const hue = biome.hue + (zt - 0.5) * 2.0 * biome.hueSpread + sr(14) * biome.hueSpread * 0.2;
-    const sat = Math.min(1, biome.sat * (1.0 + (r(15) - 0.5) * 0.25));
-    const val = 0.40 + 0.28 * (0.5 + 0.5 * Math.sin(zt * 6.2832 + biome.hue * 40.0)) + (r(16) - 0.5) * 0.06;
-    const pal = hsv(hue, sat, val);
+    const ease = (t) => t * t * (3 - 2 * t);
+    let hue, sat, val;
+    if (zt < 0.5) {
+      const t = ease(zt * 2);
+      hue = mixHue(mixHue(bPrev.hue, biome.hue, 0.5), biome.hue, t);
+      sat = (bPrev.sat + biome.sat) / 2 + (biome.sat - (bPrev.sat + biome.sat) / 2) * t;
+      val = (bPrev.valBase + biome.valBase) / 2 +
+        (biome.valBase - (bPrev.valBase + biome.valBase) / 2) * t;
+    } else {
+      const t = ease((zt - 0.5) * 2);
+      hue = mixHue(biome.hue, mixHue(biome.hue, bNext.hue, 0.5), t);
+      sat = biome.sat + ((biome.sat + bNext.sat) / 2 - biome.sat) * t;
+      val = biome.valBase + ((biome.valBase + bNext.valBase) / 2 - biome.valBase) * t;
+    }
+    hue += sr(14) * biome.hueSpread * 0.1; // tiny per-level texture only
+    const pal = hsv(hue, Math.min(1, sat), val + (r(16) - 0.5) * 0.04);
     const emissive = biome.emissive && r(17) < 0.5 ? 0.6 + r(18) * 2.2 : 0.0;
 
-    // Point light spec for this level (spawned when the camera descends into it).
-    // Sparse and dim by design: the mood targets dark interiors with pools of
-    // light, not a uniformly lit world.
-    const lightSpawn = r(20) < 0.22;
+    // Point light spec for this level (spawned when the camera descends into
+    // it). Density is a biome property: dark biomes spawn nothing, and even
+    // lit ones stay sparse — pools of light against real darkness.
+    const lightSpawn = r(20) < [0, 0.14, 0.3][biome.lightMode];
     const lightCol = hsv(biome.lightHue + sr(21) * 0.08, 0.55 + r(22) * 0.4, 1.0);
-    const lightOff = [sr(23), sr(24) * 0.6 + 0.25, sr(25)]; // camera-relative spawn offset
-    const lightInt = 0.035 + r(26) * 0.12;
+    const lightOff = [sr(23), sr(24) * 0.6 + 0.25, sr(25)]; // fallback spawn offset
+    const lightInt = 0.08 + r(26) * 0.18;
 
     return {
       level: j, zone: zone.index, biome, style, scale, rot, trans, foldL,
@@ -202,7 +229,7 @@
     };
   }
 
-  const LevelGen = { hash32, hashCombine, rnd, srnd, hsv, levelParams, zoneOf, biomeParams,
+  const LevelGen = { hash32, hashCombine, rnd, srnd, hsv, mixHue, levelParams, zoneOf, biomeParams,
     STYLE_POLY, STYLE_MENGER, STYLE_OCTA, STYLE_TGLAD, STYLE_ANCHOR };
   global.LevelGen = LevelGen;
   if (typeof module !== 'undefined' && module.exports) module.exports = LevelGen;

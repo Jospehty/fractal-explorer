@@ -72,7 +72,7 @@
         'uRes', 'uTime', 'uCamBasis', 'uFovTan', 'uCamK', 'uW', 'uWScale', 'uB',
         'uSunDir', 'uSunCol', 'uSkyCol', 'uFogCol', 'uLightN', 'uLightPos',
         'uLightCol', 'uQuality', 'uGlowAmt', 'uBound', 'uProbeOn', 'uProbe',
-        'uJitter',
+        'uJitter', 'uFogMul',
       ]) this.U[name] = gl.getUniformLocation(prog, name);
 
       this.vao = gl.createVertexArray();
@@ -239,6 +239,7 @@
       gl.uniform1i(U.uQuality, opts.quality);
       gl.uniform1f(U.uGlowAmt, opts.glow);
       gl.uniform1f(U.uBound, world.bound || 2.5);
+      gl.uniform1f(U.uFogMul, world.fogMul || 1);
       gl.uniform1f(U.uProbeOn, opts.probe ? 1 : 0);
       if (opts.probe) gl.uniform3fv(U.uProbe, opts.probe);
 
