@@ -52,6 +52,7 @@
           KeyF: 'auto', KeyH: 'help', KeyP: 'pause', KeyN: 'newseed',
           Digit1: 'q0', Digit2: 'q1', Digit3: 'q2', KeyG: 'glow',
           KeyL: 'light', KeyO: 'autolights', KeyC: 'lightcolor', KeyX: 'removelight',
+          KeyT: 'shot',
         };
         if (map[e.code]) this.onToggle(map[e.code]);
       });

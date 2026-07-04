@@ -49,6 +49,7 @@
   const STYLE_POLY = 0;   // diagonal plane folds (Sierpinski)  -> crystalline temples
   const STYLE_MENGER = 1; // abs + full sort                    -> architectural voids
   const STYLE_OCTA = 2;   // abs + partial sort                 -> canyon lattices
+  const STYLE_ICOSA = 3;  // icosahedral kaleidoscope (H3)      -> rounded organic shells
   const STYLE_TGLAD = 2;  // legacy alias
 
   /* Connectivity anchors: each style's attractor stays connected (solid walls
@@ -62,6 +63,8 @@
     { lo: 1.78, hi: 1.97, pull: [1.0, 1.0, 1.0] },   // POLY (tetra, ~4 copies)
     { lo: 2.50, hi: 2.95, pull: [1.0, 1.0, 0.52] },  // MENGER (many copies)
     { lo: 2.15, hi: 2.52, pull: [1.0, 0.82, 0.45] }, // OCTA
+    { lo: 1.84, hi: 1.99, pull: [1.0, 0.9, 0.65] },  // ICOSA (stylecheck: solid at 1.86,
+                                                     // stringy by 2.05 — keep below)
   ];
 
   // Biome: a run of consecutive levels sharing stylistic biases.
@@ -95,7 +98,9 @@
     const styleRoll = r(2);
     // Each biome commits to one style (mixing styles within a biome shreds
     // connectivity); variety across biomes comes from anchors + palettes.
-    const styleBias = styleRoll < 0.4 ? STYLE_MENGER : styleRoll < 0.75 ? STYLE_POLY : STYLE_OCTA;
+    const styleBias = styleRoll < 0.3 ? STYLE_MENGER
+      : styleRoll < 0.55 ? STYLE_POLY
+      : styleRoll < 0.8 ? STYLE_ICOSA : STYLE_OCTA;
     const anchor = STYLE_ANCHOR[styleBias];
     return {
       hue,
@@ -212,7 +217,9 @@
     }
     hue += sr(14) * biome.hueSpread * 0.1; // tiny per-level texture only
     const pal = hsv(hue, Math.min(1, sat), val + (r(16) - 0.5) * 0.04);
-    const emissive = biome.emissive && r(17) < 0.5 ? 0.6 + r(18) * 2.2 : 0.0;
+    // emissive kept below ~1.6: higher values push the tonemapper into its
+    // white plateau and whole vein-covered surfaces blow out
+    const emissive = biome.emissive && r(17) < 0.5 ? 0.5 + r(18) * 1.1 : 0.0;
 
     // Point light spec for this level (spawned when the camera descends into
     // it). Density is a biome property: dark biomes spawn nothing, and even
@@ -230,7 +237,7 @@
   }
 
   const LevelGen = { hash32, hashCombine, rnd, srnd, hsv, mixHue, levelParams, zoneOf, biomeParams,
-    STYLE_POLY, STYLE_MENGER, STYLE_OCTA, STYLE_TGLAD, STYLE_ANCHOR };
+    STYLE_POLY, STYLE_MENGER, STYLE_OCTA, STYLE_ICOSA, STYLE_TGLAD, STYLE_ANCHOR };
   global.LevelGen = LevelGen;
   if (typeof module !== 'undefined' && module.exports) module.exports = LevelGen;
 })(typeof window !== 'undefined' ? window : globalThis);

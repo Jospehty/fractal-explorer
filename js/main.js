@@ -148,6 +148,18 @@
     if (what === 'removelight') {
       flashMsg(world.removeNearestLight() ? 'light removed' : 'no lights to remove');
     }
+    if (what === 'shot') {
+      renderer.captureNext((blob) => {
+        if (!blob) { flashMsg('screenshot failed'); return; }
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'fractal_' + seed + '_K' + world.K +
+          '_z' + world.log10Zoom.toFixed(1) + '.png';
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+      });
+      flashMsg('screenshot saved');
+    }
     if (what === 'newseed') {
       location.href = location.pathname + '?seed=' + ((Math.random() * 0xffffffff) >>> 0);
     }
@@ -155,12 +167,14 @@
 
   /* ---- movement with collision (DE is a safe lower bound) ---- */
   const MIN_DE = 0.0035;
-  // Manual flight speed in frame-K units/s at multiplier ×1. Constant on
-  // purpose: the user's scroll wheel is the ONLY thing that changes speed,
-  // and rebasing rescales the frame, which carries the same APPARENT speed
-  // across zoom levels. (The old DE-proportional speed auto-slowed you into
-  // surfaces and sped you up as you left — removed per playtest feedback.)
-  const FLY_SPEED = 0.06;
+  // Manual flight speed in frame-K units/s at multiplier ×1 (divided by
+  // world.fogMul at use). The scroll wheel is the ONLY thing that changes
+  // speed. Dividing by fogMul makes the APPARENT speed continuous across
+  // rebases: frame units rescale by s at every rebase, and fogMul carries
+  // the exactly-compensating sawtooth (see world.js), so flying in or out
+  // never steps your speed — the third incarnation of this code; the first
+  // auto-scaled with surface distance, the second stepped at each rebase.
+  const FLY_SPEED = 0.09;
 
   // Rebases and wedge corrections can apply REFLECTIONS (det = -1) to the
   // camera basis. The mirrored world renders identically (the reflection is an
@@ -274,7 +288,7 @@
       const mv = input.moveVector();
       if (mv[0] || mv[1] || mv[2]) {
         moving = true;
-        const speed = FLY_SPEED * input.speedMult;
+        const speed = (FLY_SPEED / world.fogMul) * input.speedMult;
         const delta = V.add(
           V.add(V.scale(cam.right, mv[0] * speed * dt), V.scale(cam.up, mv[1] * speed * dt)),
           V.scale(cam.forward, mv[2] * speed * dt));

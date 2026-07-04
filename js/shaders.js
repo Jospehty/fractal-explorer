@@ -11,13 +11,15 @@
     gl_Position = vec4(p, 0., 1.);
   }`;
 
-  // Constants injected to match world.js
+  // Constants injected to match world.js (ICO_N is the single source of
+  // truth for the icosahedral mirror normal — see world.js)
   const DEFS = (WM) => `
   #define B_HARD ${WM.B_HARD}
   #define N_INNER ${WM.N_INNER}
   #define SLOTS ${WM.SLOTS}
   #define ESCAPE2 ${WM.ESCAPE2.toFixed(1)}
   #define MAX_LIGHTS ${WM.MAX_LIGHTS_GPU}
+  #define ICO_N vec3(${WM.ICO_N.map((v) => v.toFixed(10)).join(', ')})
   `;
 
   const FRAG = (WM) => `#version 300 es
@@ -35,6 +37,9 @@
   uniform mat3  uW;          // composed inverse linear map (frame K -> K-B)
   uniform float uWScale;
   uniform int   uB;          // active outer levels
+  uniform float uRLin;       // near-field radius: within it the outer levels all
+                             // take their linear branch, which composes to the
+                             // IDENTITY, so the outer phase is skipped entirely
   uniform vec3  uSunDir;
   uniform vec3  uSunCol;
   uniform vec3  uSkyCol;
@@ -70,10 +75,15 @@
       if (x.x < x.y) x.xy = x.yx;
       if (x.x < x.z) x.xz = x.zx;
       if (x.y < x.z) x.yz = x.zy;
-    } else {                      // OCTA: abs + partial sort
+    } else if (style < 2.5) {     // OCTA: abs + partial sort
       x = abs(x);
       if (x.x < x.y) x.xy = x.yx;
       if (x.y < x.z) x.yz = x.zy;
+    } else {                      // ICOSA: H3 kaleidoscope, 2x (abs + golden plane)
+      x = abs(x);
+      x -= 2.0 * min(0.0, dot(x, ICO_N)) * ICO_N;
+      x = abs(x);
+      x -= 2.0 * min(0.0, dot(x, ICO_N)) * ICO_N;
     }
     return x * r0.w + tr.xyz;
   }
@@ -146,7 +156,51 @@
     return (length(x) - uBound) / dr;
   }
 
-  float mapD(vec3 p, float coneEps) { vec4 t; float pl; return map(p, coneEps, t, pl); }
+  /* Distance-only variant used for ALL marching, normal, AO and shadow
+     samples. Two savings over map(): no orbit-trap bookkeeping, and the
+     near-field fast path — within uRLin of the camera every outer level
+     takes its linear branch, and those branches compose to the IDENTITY
+     (W is the exact inverse product), so the outer phase is skipped. Most
+     samples in a frame are near the camera, so this removes ~uB fold ops
+     per call. Traps are computed by one full map() call at the hit point. */
+  float mapDE(vec3 p, float coneEps) {
+    vec3 x;
+    float dr;
+    bool esc = false;
+    if (uB > 0 && dot(p, p) >= uRLin * uRLin) {
+      vec3 d = uW * p;
+      dr = uWScale;
+      for (int b = 0; b < B_HARD; b++) {
+        if (b >= uB) break;
+        vec4 cm = outerData[b*4+3];
+        if (dot(d, d) < cm.w * cm.w) {
+          d = mat3(outerData[b*4].xyz, outerData[b*4+1].xyz, outerData[b*4+2].xyz) * d;
+          dr *= lvl[b*6].w;
+        } else {
+          vec3 xx = foldLevel(cm.xyz + d, b);
+          dr *= lvl[b*6].w;
+          if (dot(xx, xx) > ESCAPE2) { x = xx; esc = true; break; }
+          d = xx - ((b + 1 < uB) ? outerData[(b+1)*4+3].xyz : uCamK);
+        }
+      }
+      if (!esc) x = uCamK + d;
+    } else {
+      x = uCamK + p;
+      dr = 1.0;
+    }
+    if (!esc) {
+      for (int i = 0; i < N_INNER; i++) {
+        int s = uB + i;
+        x = foldLevel(x, s);
+        dr *= lvl[s*6].w;
+        if (dot(x, x) > ESCAPE2) break;
+        ${global.__SHADER_DEBUG === 'nocone' ? '' : 'if (1.0 < dr * coneEps) break;'}
+      }
+    }
+    return (length(x) - uBound) / dr;
+  }
+
+  float mapD(vec3 p, float coneEps) { return mapDE(p, coneEps); }
 
   vec3 calcNormal(vec3 p, float eps, float coneEps) {
     vec2 k = vec2(1.0, -1.0);
@@ -191,10 +245,26 @@
     return (atan((tmax + b) * hs) - atan(b * hs)) * hs;
   }
 
+  float hash12(vec2 v) {
+    vec3 p3 = fract(vec3(v.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+  }
+
   vec3 skyColor(vec3 rd) {
     float sd = max(dot(rd, uSunDir), 0.0);
     vec3 sky = mix(uFogCol * 0.9, uSkyCol, clamp(rd.y * 0.5 + 0.55, 0.0, 1.0));
     sky += uSunCol * (pow(sd, 320.0) * 3.2 + pow(sd, 16.0) * 0.18);
+    // faint starfield fades in when the biome sky is dark (anchored to world
+    // directions, so it rides sun/frame rotations like everything else)
+    float lum = dot(uSkyCol, vec3(0.333));
+    if (lum < 0.2) {
+      vec2 sc = vec2(atan(rd.z, rd.x), asin(clamp(rd.y, -1.0, 1.0))) * 42.0;
+      vec2 cf = fract(sc) - 0.5;
+      float star = smoothstep(0.994, 1.0, hash12(floor(sc)))
+                 * smoothstep(0.16, 0.03, dot(cf, cf));
+      sky += vec3(0.75, 0.85, 1.0) * star * (0.2 - lum) * 4.0;
+    }
     return sky;
   }
 
@@ -203,12 +273,6 @@
 
   vec3 aces(vec3 x) {
     return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
-  }
-
-  float hash12(vec2 v) {
-    vec3 p3 = fract(vec3(v.xyx) * 0.1031);
-    p3 += dot(p3, p3.yzx + 33.33);
-    return fract((p3.x + p3.y) * p3.z);
   }
 
   uniform float uProbeOn;
@@ -246,10 +310,11 @@
       if (i >= MAXSTEP) { hit = true; exhausted = true; break; } // grazing geometry
       steps = i;
       vec3 p = ro + rd * t;
-      d = map(p, t * pix * 0.22, trap, trapPl);
+      d = mapDE(p, t * pix * 0.22); // trap-free marching; traps sampled at hit
       if (d < t * pix * 0.45 + 2e-6) { hit = true; break; }
       t += min(d, tmax * 0.5) * 0.92;
     }
+    if (hit) map(ro + rd * t, t * pix * 0.22, trap, trapPl); // orbit traps for shading
     ${global.__SHADER_DEBUG === 'stats'
       ? `fragColor = vec4(clamp(log2(t + 1.0) / 15.0, 0.0, 1.0),
                           float(steps) / float(MAXSTEP), hit ? 1.0 : 0.0, 1.0); return;`
@@ -289,7 +354,7 @@
         sh = softShadow(p + n * eps * 3.0, uSunDir, eps * 8.0, 40.0, 9.0, coneEps, uQuality == 1 ? 40 : 64);
       }
       vec3 hv = normalize(uSunDir - rd);
-      float spec = pow(max(dot(n, hv), 0.0), 42.0) * 0.6;
+      float spec = pow(max(dot(n, hv), 0.0), 42.0) * 0.45;
 
       ${global.__SHADER_DEBUG === 'shade'
         ? 'fragColor = vec4(dot(alb, vec3(0.33)), sunDiff * sh, ao, 1.0); return;'
@@ -364,6 +429,7 @@
     // grows ~s^2 per rebase to keep surface lighting scale-invariant, but the
     // scatter integral only falls off ~1/distance, so it must be clamped or
     // ancient giant lights white out the frame.
+    vec3 glowAcc = vec3(0.0);
     for (int li = 0; li < MAX_LIGHTS; li++) {
       if (li >= uLightN) break;
       float sc = inscatter(ro, rd, uLightPos[li].xyz, fogT);
@@ -371,8 +437,11 @@
       // tight orb profile: the raw 1/h scatter is too broad and washes the
       // whole frame; sc^2/(1+sc/2) keeps a hot core with negligible skirt
       float orb = uLightCol[li].w * sc * sc * 0.013 / (1.0 + 0.5 * sc);
-      col += uLightCol[li].rgb * min(orb, 0.9) * ext * uGlowAmt;
+      glowAcc += uLightCol[li].rgb * min(orb, 0.9) * ext * uGlowAmt;
     }
+    // soft-compress the SUM of glows: several overlapping orbs used to stack
+    // linearly and blow the frame out to white
+    col += glowAcc / (1.0 + 0.55 * dot(glowAcc, vec3(0.333)));
     // sun glare kept subtle when occluded
     col += uSunCol * pow(max(dot(rd, uSunDir), 0.0), 8.0) * 0.03;
 

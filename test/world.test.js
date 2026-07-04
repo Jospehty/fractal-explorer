@@ -33,6 +33,10 @@ function fMat(cols, v) { // cols: 9 floats column-major, like GLSL mat3
 }
 function fLen(a) { return fr(Math.hypot(a[0], a[1], a[2])); }
 
+// GLSL float32 image of the icosahedral mirror normal (matches the literal
+// injected into the shader by DEFS in shaders.js)
+const ICO_NF = WM.ICO_N.map((v) => fr(parseFloat(v.toFixed(10))));
+
 function foldF32(x, slot) {
   // slot: {rotCols[9], scale, style, foldL, trans[3]}
   x = fMat(slot.rotCols, x);
@@ -46,6 +50,13 @@ function foldF32(x, slot) {
     if (fr(x[0] + x[1]) < 0) { const t = fr(-x[0]); x[0] = fr(-x[1]); x[1] = t; }
     if (fr(x[0] + x[2]) < 0) { const t = fr(-x[0]); x[0] = fr(-x[2]); x[2] = t; }
     if (fr(x[1] + x[2]) < 0) { const t = fr(-x[1]); x[1] = fr(-x[2]); x[2] = t; }
+  } else if (S > 2.5) { // ICOSA: 2x (abs + golden plane fold), unconditional form
+    for (let round = 0; round < 2; round++) {
+      x = f3(Math.abs(x[0]), Math.abs(x[1]), Math.abs(x[2]));
+      const dt = fr(fr(x[0] * ICO_NF[0]) + fr(fr(x[1] * ICO_NF[1]) + fr(x[2] * ICO_NF[2])));
+      const s2 = fr(2 * Math.min(0, dt));
+      x = f3(x[0] - fr(s2 * ICO_NF[0]), x[1] - fr(s2 * ICO_NF[1]), x[2] - fr(s2 * ICO_NF[2]));
+    }
   } else { // OCTA
     x = f3(Math.abs(x[0]), Math.abs(x[1]), Math.abs(x[2]));
     if (x[0] < x[1]) { const t = x[0]; x[0] = x[1]; x[1] = t; }
@@ -153,21 +164,45 @@ function checkRebaseInvariance(world, tag) {
     // (relative to r + |DE|, since points at the camera's surface-distance
     // scale can be displaced by up to their boundary distance):
     //   minor  < 10%  — unlimited; below the visibility of a rebase seam
-    //   major  < 50%  — at most a few per sample set; occurs when the camera
-    //                   sits in a wedge corner with several boundaries close
-    //                   (empirical worst ~0.4, seed 777 K=8, after the
-    //                   HORIZON=1.35e5 window extension put more levels in
-    //                   play). More or bigger than this is a regression.
+    //   major  < 50%  — at most a handful per sample set; occurs when the
+    //                   camera sits in a wedge corner with several fold
+    //                   boundaries close (empirical: up to 6/24 at shallow K
+    //                   where the window necessarily spans every level, and
+    //                   after the HORIZON=1.35e5 window extension). More or
+    //                   bigger than this is a regression.
     const rel = err / (rDist + Math.abs(des[i]));
     const exact = err < 2e-4 * Math.max(Math.abs(des[i]), 1e-9) || rel < 2e-5;
     if (!exact && rel >= 0.1) outliers++;
     check(exact || rel < 0.5,
       `${tag} DE invariance pt${i}: before=${des[i]} after=${de2} err=${err} r=${rDist}`);
   }
-  check(outliers <= 4, `${tag} too many major double-crossing outliers: ${outliers}/24`);
+  check(outliers <= 8, `${tag} too many major double-crossing outliers: ${outliers}/24`);
   world.ascend();
   const err = V.dist(world.camPos, camBefore);
   check(err < 1e-10, `${tag} ascend∘descend identity err=${err}`);
+}
+
+/* The near-field fast path (world.RLin, mirrored by mapDE in the shader)
+   must agree with the full outer walk everywhere inside RLin: within that
+   radius every level takes its linear branch and the branches compose to
+   the identity, so the fast path (skip the outer phase) is EXACT — any
+   disagreement beyond the slow path's own rounding noise is a bug in the
+   RLin margin computation. */
+function checkFastPath(world, tag) {
+  if (!isFinite(world.RLin) || world.RLin <= 0) return;
+  for (let i = 0; i < 60; i++) {
+    const r = world.RLin * 0.999 * Math.pow(10, -3 * rnd());
+    const p = V.add(world.camPos, V.scale(rndDir(), r));
+    const fast = world.de(p);
+    const slow = world.de(p, true);
+    const err = Math.abs(fast - slow);
+    // the SLOW path carries the noise here: W is a product of ~15 matrix
+    // inversions and the walk folds O(1) orbit numbers ~15 times (observed
+    // ~3e-7 relative at deep K). A genuine RLin bug errs at the scale of r
+    // or the DE itself, 5+ orders larger than this tolerance.
+    const tol = 3e-6 * (Math.abs(slow) + r) + 1e-10;
+    check(err < tol, `${tag} fast-path DE r=${r.toExponential(2)} fast=${fast} slow=${slow} err=${err}`);
+  }
 }
 
 function checkF32Pipeline(world, tag) {
@@ -183,7 +218,11 @@ function checkF32Pipeline(world, tag) {
     const de32 = mapF32(world, packed, rel3);
     // Tolerance: absolute error allowed grows with distance from camera
     // (far geometry only needs sub-angular accuracy; a pixel is ~1e-3 rad).
-    const tol = Math.max(3e-4 * Math.abs(de64), 5e-6 + 4.5e-5 * r, 1e-7);
+    // The 2.5e-4*r coefficient is calibrated for ICOSA: unlike the other
+    // styles, whose folds are EXACT in f32 (abs/swap/negate), its Householder
+    // fold rounds, so f32/f64 escape iterations diverge more often at range.
+    // Still ~5x sub-pixel at the default FOV.
+    const tol = Math.max(3e-4 * Math.abs(de64), 5e-6 + 2.5e-4 * r, 1e-7);
     const err = Math.abs(de32 - de64);
     if (err / tol > worst.rel) worst = { rel: err / tol, r, de64, de32 };
     check(err < tol, `${tag} f32-vs-f64 r=${r.toExponential(2)} de64=${de64} de32=${de32} err=${err}`);
@@ -208,10 +247,12 @@ function dive(seed, depthChecks) {
       continue;
     }
     // dive by probing: move toward whichever direction minimizes sampled DE.
-    // Mix of short and long probes so flat wall pockets can be escaped.
+    // Mix of short and long probes so flat wall pockets can be escaped
+    // (ICOSA terrain has larger flat pockets than the angular styles, hence
+    // the extra long-range probes).
     let bestP = null, bestD = Infinity;
-    for (let c = 0; c < 14; c++) {
-      const radius = d * (c < 8 ? 0.6 : 1.5 + rnd() * 6);
+    for (let c = 0; c < 18; c++) {
+      const radius = d * (c < 8 ? 0.6 : 1.5 + rnd() * 10);
       const cand = V.add(world.camPos, V.scale(rndDir(), radius));
       const cd = world.de(cand);
       if (cd >= 0 && cd < bestD) { bestD = cd; bestP = cand; }
@@ -225,6 +266,7 @@ function dive(seed, depthChecks) {
       console.log(`-- checking at ${tag} (steps=${steps})`);
       world.updateChain();
       checkChain(world, tag);
+      checkFastPath(world, tag);
       checkRebaseInvariance(world, tag);
       world.updateChain();
       checkF32Pipeline(world, tag);

@@ -40,6 +40,7 @@ Install the **Live Server** extension, right-click `index.html`, and select
 | C | cycle the manual light color (auto / warm / cold / ember / emerald / violet / white) |
 | O | toggle automatic light spawning (off = fully manual lighting) |
 | X | remove the light nearest to you |
+| T | save the current frame as a PNG (combine with holding still for supersampled shots) |
 | F | autopilot dive |
 | G | toggle light glow |
 | 1 / 2 / 3 | render quality (soft shadows, light shadows) |
@@ -60,7 +61,20 @@ Everything worth knowing about the math lives in a long header comment in
 - The fractal is a kaleidoscopic IFS: each absolute depth level `j` has its
   own fold recipe (reflection-group fold + uniform scale + translation),
   palette and lighting, derived deterministically from `hash(seed, j)` in
-  `js/levelgen.js`. Levels are grouped into biomes that share stylistic biases.
+  `js/levelgen.js`. Levels are grouped into biomes that share stylistic
+  biases. Four fold styles: POLY (crystalline), MENGER (architectural),
+  OCTA (canyons) and ICOSA (the icosahedral H3 kaleidoscope — rounded,
+  organic, smooth surfaces). Every fold op must be a mirror of a FINITE
+  reflection group or rebasing stops being seamless; that rules out curved
+  maps (sphere folds, Mandelbulb powers) but higher-order kaleidoscopes are
+  fair game.
+- Movement speed and fog density are tied to a per-level sawtooth (`fogMul`)
+  that is rescaled by exactly `1/s` at each rebase, so apparent speed and
+  optical depth are continuous while zooming in AND out.
+- Performance: marching, normals, AO and shadows use a trap-free DE with a
+  near-field fast path (inside `RLin`, the outer window's linear branches
+  compose to the identity, so the outer phase is skipped); orbit traps for
+  coloring are computed once per pixel at the hit point.
 - The camera lives in frame `K` (the *rebase level*). Approaching the surface
   pushes the camera through the level-`K` fold (float64, exact) and increments
   `K`, so camera-local numbers stay O(1) at unbounded depth.

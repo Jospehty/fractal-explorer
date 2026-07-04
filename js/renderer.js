@@ -72,7 +72,7 @@
         'uRes', 'uTime', 'uCamBasis', 'uFovTan', 'uCamK', 'uW', 'uWScale', 'uB',
         'uSunDir', 'uSunCol', 'uSkyCol', 'uFogCol', 'uLightN', 'uLightPos',
         'uLightCol', 'uQuality', 'uGlowAmt', 'uBound', 'uProbeOn', 'uProbe',
-        'uJitter', 'uFogMul',
+        'uJitter', 'uFogMul', 'uRLin',
       ]) this.U[name] = gl.getUniformLocation(prog, name);
 
       this.vao = gl.createVertexArray();
@@ -82,9 +82,10 @@
       this.resScale = 0.75;
       this.minScale = 0.35;
       this.maxScale = 1.0;
-      this.targetMs = 18;
+      this.targetMs = 15.5; // aim for a stable 60fps
       this.emaMs = 16;
       this.fixedScale = null; // set for deterministic screenshots
+      this._capture = null;   // one-shot canvas capture callback (T key)
 
       this.lightPosBuf = new Float32Array(WM.MAX_LIGHTS_GPU * 4);
       this.lightColBuf = new Float32Array(WM.MAX_LIGHTS_GPU * 4);
@@ -136,6 +137,19 @@
         b: this._makeTarget(w, h, accFmt),
       };
       return true;
+    }
+
+    /* One-shot capture of the next rendered frame as a PNG blob (T key).
+       Must read the canvas in the same task as the draw — the drawing buffer
+       is not preserved across tasks. */
+    captureNext(cb) {
+      this._capture = cb;
+    }
+    _maybeCapture() {
+      if (!this._capture) return;
+      const cb = this._capture;
+      this._capture = null;
+      this.canvas.toBlob(cb, 'image/png');
     }
 
     adaptResolution(frameMs) {
@@ -207,6 +221,8 @@
       gl.uniform3f(U.uCamK, world.camPos[0], world.camPos[1], world.camPos[2]);
       gl.uniformMatrix3fv(U.uW, false, V.mToCols(world.W));
       gl.uniform1f(U.uWScale, world.WScale);
+      // 1e18: effectively "always fast path" when there are no outer levels
+      gl.uniform1f(U.uRLin, Number.isFinite(world.RLin) ? world.RLin : 1e18);
       gl.uniform1i(U.uB, (typeof window !== 'undefined' && window.__SHADER_DEBUG === 'noouter') ? 0 : world.outer.length);
       gl.uniform3fv(U.uSunDir, world.sunDir);
       gl.uniform3fv(U.uSunCol, opts.sunCol);
@@ -247,6 +263,7 @@
         gl.uniform2f(U.uJitter, 0, 0);
         gl.bindFramebuffer(gl.FRAMEBUFFER, null);
         gl.drawArrays(gl.TRIANGLES, 0, 3);
+        this._maybeCapture();
         return;
       }
 
@@ -281,6 +298,7 @@
 
       const swap = T.a; T.a = T.b; T.b = swap;
       this.accumN++;
+      this._maybeCapture();
     }
   }
 

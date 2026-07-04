@@ -73,6 +73,30 @@
 
   const SQ2 = Math.SQRT2;
 
+  /* ICOSA style: the H3 (icosahedral) kaleidoscope. Mirrors: the three
+     coordinate planes plus the golden plane with normal ICO_N. All ops are
+     pure reflections from a FINITE Coxeter group (order 120), which is what
+     the rebase architecture requires (see header).
+     ORIENTATION MATTERS: for the icosahedron with vertices at the cyclic
+     permutations of (0, ±1, ±φ) — the orientation whose mirrors include the
+     coordinate planes — the golden mirror normals are the ODD permutations
+     of (±1, ±φ, ±1/φ)/2. The cyclic ones belong to the reflected dual: they
+     generate an INFINITE group together with the coordinate mirrors, which
+     breaks preimages and wedge normalization (symptom: "wedge normalization
+     did not settle"). Verified: reflecting vertex (0,1,φ) in ICO_N gives
+     vertex (1,-φ,0). |((1-φ), φ, 1)| = 2 exactly, so ICO_N is exact in both
+     f32 and f64. */
+  const PHI = (1 + Math.sqrt(5)) / 2;
+  const ICO_N = [(1 - PHI) / 2, PHI / 2, 0.5];
+  const ICO_HOUSE = (() => { // I - 2 n nᵀ, row-major
+    const n = ICO_N;
+    return [
+      1 - 2 * n[0] * n[0], -2 * n[0] * n[1], -2 * n[0] * n[2],
+      -2 * n[0] * n[1], 1 - 2 * n[1] * n[1], -2 * n[1] * n[2],
+      -2 * n[0] * n[2], -2 * n[1] * n[2], 1 - 2 * n[2] * n[2],
+    ];
+  })();
+
   /* ---- the fold: float64 reference implementation ------------------------
      rec=true records {M (linear action, row-major), margin (distance from the
      input point to the nearest branch boundary, in level-input units)}.
@@ -101,6 +125,21 @@
       if (x[0] + x[2] < 0) { const t = -x[0]; x[0] = -x[2]; x[2] = t; if (rec) M = V.mMul([0,0,-1, 0,1,0, -1,0,0], M); }
       if (rec) margin = Math.min(margin, Math.abs(x[1] + x[2]) / SQ2);
       if (x[1] + x[2] < 0) { const t = -x[1]; x[1] = -x[2]; x[2] = t; if (rec) M = V.mMul([1,0,0, 0,0,-1, 0,-1,0], M); }
+    } else if (S === LG.STYLE_ICOSA) {
+      // H3 kaleidoscope: two rounds of (abs, golden-plane fold)
+      for (let round = 0; round < 2; round++) {
+        if (rec) {
+          margin = Math.min(margin, Math.abs(x[0]), Math.abs(x[1]), Math.abs(x[2]));
+          M = V.mMul([Math.sign(x[0]) || 1, 0, 0, 0, Math.sign(x[1]) || 1, 0, 0, 0, Math.sign(x[2]) || 1], M);
+        }
+        x = [Math.abs(x[0]), Math.abs(x[1]), Math.abs(x[2])];
+        const t = x[0] * ICO_N[0] + x[1] * ICO_N[1] + x[2] * ICO_N[2];
+        if (rec) margin = Math.min(margin, Math.abs(t));
+        if (t < 0) {
+          x = [x[0] - 2 * t * ICO_N[0], x[1] - 2 * t * ICO_N[1], x[2] - 2 * t * ICO_N[2]];
+          if (rec) M = V.mMul(ICO_HOUSE, M);
+        }
+      }
     } else {
       // OCTA: abs fold followed by the three diagonal plane folds
       if (rec) {
@@ -144,17 +183,29 @@
             (sg & 4 ? -1 : 1) * w[pm[2]],
           ]);
     } else {
-      // POLY: orbit of w under the three diagonal reflections (finite group)
-      const R = [
-        (v) => [-v[1], -v[0], v[2]],
-        (v) => [-v[2], v[1], -v[0]],
-        (v) => [v[0], -v[2], -v[1]],
-      ];
+      // POLY / ICOSA: BFS orbit of w under the style's mirror generators
+      // (both groups are finite — order 24 and 120 — so the orbit closes)
+      const R = S === LG.STYLE_ICOSA
+        ? [
+            (v) => [-v[0], v[1], v[2]],
+            (v) => [v[0], -v[1], v[2]],
+            (v) => [v[0], v[1], -v[2]],
+            (v) => {
+              const t = v[0] * ICO_N[0] + v[1] * ICO_N[1] + v[2] * ICO_N[2];
+              return [v[0] - 2 * t * ICO_N[0], v[1] - 2 * t * ICO_N[1], v[2] - 2 * t * ICO_N[2]];
+            },
+          ]
+        : [
+            (v) => [-v[1], -v[0], v[2]],
+            (v) => [-v[2], v[1], -v[0]],
+            (v) => [v[0], -v[2], -v[1]],
+          ];
+      const cap = S === LG.STYLE_ICOSA ? 200 : 60;
       const seen = new Map();
       const key = (v) => v.map((x) => x.toFixed(12)).join(',');
       const queue = [w];
       seen.set(key(w), w);
-      while (queue.length && seen.size < 60) {
+      while (queue.length && seen.size < cap) {
         const v = queue.pop();
         for (const r of R) {
           const u = r(v);
@@ -246,9 +297,12 @@
       return V.mScale(M, 1 / s);
     }
 
-    /* Rebuild the outer chain from the current camera position. */
+    /* Rebuild the outer chain from the current camera position. Each failed
+       attempt applies one wedge correction and restarts; large camera jumps
+       (autopilot/tests) at deep K can legitimately need a few corrections
+       per level of the window, hence the generous cap. */
     updateChain() {
-      for (let attempt = 0; attempt < 2 * B_HARD + 4; attempt++) {
+      for (let attempt = 0; attempt < 4 * B_HARD + 8; attempt++) {
         if (this._tryChain()) return;
       }
       // Should be unreachable; keep whatever partial chain we have.
@@ -310,6 +364,24 @@
       }
       this.W = W;
       this.WScale = WScale;
+      /* Near-field fast path radius: for |p - camPos| < RLin, EVERY outer
+         level takes its linear branch, and the composed action
+         M_{B-1}···M_0·W is the IDENTITY by construction (W is exactly the
+         inverse product), so the outer phase can be skipped entirely —
+         geometry within RLin of the camera is fully described by the inner
+         levels. |d_b| = |p|·cum_b with cum_b = WScale·Π_{i<b} s_i, so the
+         all-linear condition |d_b| < m_b for all b reduces to one radius
+         test. The renderer uses this for all marching, normal, AO and shadow
+         samples near the camera — most of them — removing ~B fold/mat ops
+         per map() call. (It is also more accurate than the walk: the walk
+         carries the rounding noise of W's accumulated matrix inversions.) */
+      let RLin = Infinity;
+      let cum = WScale;
+      for (let b = 0; b < this.outer.length; b++) {
+        RLin = Math.min(RLin, this.outer[b].margin / cum);
+        cum *= this.outer[b].scale;
+      }
+      this.RLin = this.outer.length ? RLin : Infinity;
       // Attractor bounding radius over the whole active window: the invariant
       // ball satisfies R >= |t_j|/(s_j - 1) for every level. The DE formula
       // (|x| - R)/dr is a rigorous lower bound for ANY truncation depth
@@ -324,18 +396,26 @@
       return true;
     }
 
-    /* Float64 distance estimator at frame-K point p (absolute frame-K coords). */
-    de(p) {
+    /* Float64 distance estimator at frame-K point p (absolute frame-K coords).
+       forceSlow skips the near-field fast path (used by tests to validate it). */
+    de(p, forceSlow) {
       let x, dr;
       let escaped = false;
       if (this.outer.length) {
-        const d = V.mMulV(this.W, V.sub(p, this.camPos));
-        x = V.add(this.outer[0].c, d);
-        dr = this.WScale;
-        for (let b = 0; b < this.outer.length; b++) {
-          x = evalFold(x, this.params(this.outer[b].level)).x;
-          dr *= this.outer[b].scale;
-          if (V.dot(x, x) > ESCAPE2) { escaped = true; break; }
+        const rel = V.sub(p, this.camPos);
+        if (!forceSlow && V.len(rel) < this.RLin) {
+          // all outer levels act linearly here and compose to the identity
+          x = p.slice();
+          dr = 1;
+        } else {
+          const d = V.mMulV(this.W, rel);
+          x = V.add(this.outer[0].c, d);
+          dr = this.WScale;
+          for (let b = 0; b < this.outer.length; b++) {
+            x = evalFold(x, this.params(this.outer[b].level)).x;
+            dr *= this.outer[b].scale;
+            if (V.dot(x, x) > ESCAPE2) { escaped = true; break; }
+          }
         }
       } else {
         x = p.slice();
@@ -633,6 +713,7 @@
   const WorldMod = {
     World, evalFold, foldPreimage, wedgeNormalize,
     B_HARD, B_MIN, HORIZON, N_INNER, SLOTS, DESCEND_DE, ESCAPE2, MAX_LIGHTS_GPU,
+    PHI, ICO_N,
   };
   global.WorldMod = WorldMod;
   if (typeof module !== 'undefined' && module.exports) module.exports = WorldMod;
