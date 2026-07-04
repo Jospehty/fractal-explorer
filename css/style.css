@@ -27,6 +27,7 @@ body { font-family: 'Segoe UI', system-ui, sans-serif; color: #dfe7ef; }
   align-items: center; justify-content: center; gap: 14px;
   background: radial-gradient(ellipse at center, rgba(4,8,16,.35), rgba(2,4,8,.78));
   cursor: pointer; text-align: center; padding: 24px;
+  user-select: none; -webkit-user-select: none;
 }
 #overlay .title {
   font-size: 42px; font-weight: 200; letter-spacing: 8px; text-transform: uppercase;

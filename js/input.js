@@ -12,19 +12,34 @@
       this.rollDelta = 0;
       this.speedMult = 1.0;
       this.pointerLocked = false;
+      this.isDragging = false;
       this.onToggle = () => {};   // key callbacks (F, H, P, 1..3, N, R)
       this.touchActive = false;
       this._touchForward = 0;
-
-      canvas.addEventListener('click', () => {
-        if (!this.pointerLocked && !this.touchActive) canvas.requestPointerLock();
-      });
+      // Removed the click event since mousedown handles it better and avoids target-change cancellation
       document.addEventListener('pointerlockchange', () => {
         this.pointerLocked = document.pointerLockElement === canvas;
         this.onToggle('lock', this.pointerLocked);
       });
+      document.addEventListener('mousedown', (e) => {
+        if (e.target.closest('#help')) return;
+        if (!this.pointerLocked && !this.touchActive) canvas.requestPointerLock();
+        if (e.button === 0) {
+          this.isDragging = true;
+          this.onToggle('lock', true);
+        }
+      });
+      document.addEventListener('mouseup', (e) => {
+        if (e.button === 0) {
+          this.isDragging = false;
+          // Only bring back the overlay if pointer lock actually failed
+          if (!this.pointerLocked) {
+            this.onToggle('lock', false);
+          }
+        }
+      });
       document.addEventListener('mousemove', (e) => {
-        if (!this.pointerLocked) return;
+        if (!this.pointerLocked && !this.isDragging) return;
         this.yawDelta += e.movementX * 0.0021;
         this.pitchDelta += e.movementY * 0.0021;
       });
