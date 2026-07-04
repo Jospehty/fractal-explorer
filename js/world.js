@@ -1,0 +1,528 @@
+/* world.js — the deep-zoom world model.
+   ============================================================================
+   THE INFINITE-ZOOM ARCHITECTURE
+   ----------------------------------------------------------------------------
+   The fractal is a kaleidoscopic IFS where every absolute level j has its own
+   parameters (levelgen.js). One "iteration" maps frame-j coordinates to
+   frame-(j+1) coordinates:        x_{j+1} = Fold_j(x_j)
+   where Fold_j is a piecewise reflection group fold (rotation, abs/plane/box
+   folds) followed by a uniform scale s_j and a translation. Level-j features
+   have size O(1) in frame j. Every fold boundary is a REFLECTION, and each
+   fold plane is an exact mirror symmetry of all geometry generated at that
+   level and deeper (mirrored points have identical forward orbits). This
+   property is what makes everything below seamless; do not add fold ops with
+   translation boundaries (e.g. the classic Menger z-wrap) — they break it.
+
+   The camera lives in frame K ("the rebase level"). When it nears the surface
+   we REBASE: push the camera through Fold_K (float64, exact) and K++. Camera
+   numbers stay O(1) forever: no lower bound on depth. Ascending inverts this
+   via fold preimages.
+
+   Outer levels (the giant vistas): the shader first runs a window of B outer
+   levels K-B..K-1. Per frame we maintain in float64 the camera "chain":
+     c_j    = camera position expressed in frame j
+     M_j    = exact linear action (Jacobian) of Fold_j at c_j
+     m_j    = distance from c_j to the nearest fold-branch boundary
+   A ray point p (camera-relative, frame K) starts as d = W·p in frame K-B
+   (W = product of inverse linear maps — a pure similarity, so tiny d keeps
+   full *relative* float32 precision). Per outer level:
+     |d| < m_j → d ← M_j·d                       (exact linear branch)
+     else      → x = c_j + d; d ← Fold_j(x) − c_{j+1}   (true fold; the point is
+                  far away, so f32 absolute error is sub-pixel at its distance)
+   After the outer window, x = c_K + d is a true frame-K coordinate and inner
+   levels K..K+N run the plain fold pipeline on O(1) numbers.
+
+   Chain maintenance uses fold PREIMAGES: c_j is a preimage of c_{j+1} under
+   Fold_j, chosen nearest to the previous frame's c_j (mirror choices are
+   symmetry-equivalent, so an occasional forced switch is invisible). If
+   c_{j+1} exits Fold_j's image entirely (camera flew "through a kaleidoscope
+   mirror"), we reflect it back with the wedge normalization T — an exact
+   symmetry of levels ≥ j+1 — lift T through the chain to frame K, and apply it
+   to the camera, lights and sun. T → identity at the mirror itself, so the
+   correction is seamless.
+   ============================================================================ */
+(function (global) {
+  'use strict';
+  const V = global.V || require('./vec.js');
+  const LG = global.LevelGen || require('./levelgen.js');
+
+  /* Outer window sizing: a level j may only be dropped from the window when the
+     nearest crossing of its fold boundaries is beyond the fog horizon (in
+     camera units, margin_j × Π s). Otherwise dropping it would visibly change
+     geometry near the camera. The window is therefore dynamic: at least B_MIN
+     levels for vistas, growing up to B_HARD when the camera lingers near an
+     old fold plane. */
+  const B_MIN = 8;
+  const B_HARD = 24;
+  const HORIZON = 3.0e4;  // matches the renderer far fog/TMAX distance
+  const N_INNER = 16;     // inner detail levels
+  const SLOTS = B_HARD + N_INNER;
+  const ESCAPE2 = 900.0;  // escape radius^2 for the orbit
+  const DESCEND_DE = 0.02;
+  const MAX_LIGHTS_STORED = 14;
+  const MAX_LIGHTS_GPU = 6;
+
+  const SQ2 = Math.SQRT2;
+
+  /* ---- the fold: float64 reference implementation ------------------------
+     rec=true records {M (linear action, row-major), margin (distance from the
+     input point to the nearest branch boundary, in level-input units)}.
+     MUST stay structurally identical to foldLevel() in shaders.js.          */
+  function evalFold(xin, P, rec) {
+    let x = V.mMulV(P.rot, xin);
+    let M = rec ? P.rot.slice() : null;
+    let margin = Infinity;
+    const S = P.style;
+
+    if (S === LG.STYLE_MENGER) {
+      if (rec) {
+        margin = Math.min(margin, Math.abs(x[0]), Math.abs(x[1]), Math.abs(x[2]));
+        M = V.mMul([Math.sign(x[0]) || 1, 0, 0, 0, Math.sign(x[1]) || 1, 0, 0, 0, Math.sign(x[2]) || 1], M);
+      }
+      x = [Math.abs(x[0]), Math.abs(x[1]), Math.abs(x[2])];
+      if (rec) margin = Math.min(margin,
+        Math.abs(x[0] - x[1]) / SQ2, Math.abs(x[0] - x[2]) / SQ2, Math.abs(x[1] - x[2]) / SQ2);
+      if (x[0] < x[1]) { const t = x[0]; x[0] = x[1]; x[1] = t; if (rec) M = V.mMul([0,1,0, 1,0,0, 0,0,1], M); }
+      if (x[0] < x[2]) { const t = x[0]; x[0] = x[2]; x[2] = t; if (rec) M = V.mMul([0,0,1, 0,1,0, 1,0,0], M); }
+      if (x[1] < x[2]) { const t = x[1]; x[1] = x[2]; x[2] = t; if (rec) M = V.mMul([1,0,0, 0,0,1, 0,1,0], M); }
+    } else if (S === LG.STYLE_POLY) {
+      if (rec) margin = Math.min(margin, Math.abs(x[0] + x[1]) / SQ2);
+      if (x[0] + x[1] < 0) { const t = -x[0]; x[0] = -x[1]; x[1] = t; if (rec) M = V.mMul([0,-1,0, -1,0,0, 0,0,1], M); }
+      if (rec) margin = Math.min(margin, Math.abs(x[0] + x[2]) / SQ2);
+      if (x[0] + x[2] < 0) { const t = -x[0]; x[0] = -x[2]; x[2] = t; if (rec) M = V.mMul([0,0,-1, 0,1,0, -1,0,0], M); }
+      if (rec) margin = Math.min(margin, Math.abs(x[1] + x[2]) / SQ2);
+      if (x[1] + x[2] < 0) { const t = -x[1]; x[1] = -x[2]; x[2] = t; if (rec) M = V.mMul([1,0,0, 0,0,-1, 0,-1,0], M); }
+    } else {
+      // OCTA: abs fold followed by the three diagonal plane folds
+      if (rec) {
+        margin = Math.min(margin, Math.abs(x[0]), Math.abs(x[1]), Math.abs(x[2]));
+        M = V.mMul([Math.sign(x[0]) || 1, 0, 0, 0, Math.sign(x[1]) || 1, 0, 0, 0, Math.sign(x[2]) || 1], M);
+      }
+      x = [Math.abs(x[0]), Math.abs(x[1]), Math.abs(x[2])];
+      if (rec) margin = Math.min(margin, Math.abs(x[0] - x[1]) / SQ2);
+      if (x[0] < x[1]) { const t = x[0]; x[0] = x[1]; x[1] = t; if (rec) M = V.mMul([0,1,0, 1,0,0, 0,0,1], M); }
+      if (rec) margin = Math.min(margin, Math.abs(x[1] - x[2]) / SQ2);
+      if (x[1] < x[2]) { const t = x[1]; x[1] = x[2]; x[2] = t; if (rec) M = V.mMul([1,0,0, 0,0,1, 0,1,0], M); }
+    }
+
+    x = [x[0] * P.scale + P.trans[0], x[1] * P.scale + P.trans[1], x[2] * P.scale + P.trans[2]];
+    if (rec) M = V.mScale(M, P.scale);
+    return rec ? { x, M, margin } : { x };
+  }
+
+  // style ops only (post-rotation, pre-scale part of the fold), for preimages
+  function styleOps(v, P) {
+    return evalFold(V.mMulV(V.mTranspose(P.rot), v), { ...P, scale: 1, trans: [0, 0, 0] }).x;
+    // note: undoes the rotation first so only the style part applies
+  }
+
+  /* ---- fold preimage ------------------------------------------------------
+     Find xin with Fold_j(xin) = y, choosing the candidate nearest `hint`.
+     Returns null when y is outside the fold image (wedge exit).             */
+  function foldPreimage(y, P, hint) {
+    const w = [(y[0] - P.trans[0]) / P.scale, (y[1] - P.trans[1]) / P.scale, (y[2] - P.trans[2]) / P.scale];
+    const h1 = V.mMulV(P.rot, hint); // hint in style-op input space
+    const S = P.style;
+    let cands = [];
+    if (S === LG.STYLE_MENGER || S === LG.STYLE_OCTA) {
+      // preimages live among the signed permutations of w (validated below)
+      const perms = [[0,1,2],[0,2,1],[1,0,2],[1,2,0],[2,0,1],[2,1,0]];
+      for (const pm of perms)
+        for (let sg = 0; sg < 8; sg++)
+          cands.push([
+            (sg & 1 ? -1 : 1) * w[pm[0]],
+            (sg & 2 ? -1 : 1) * w[pm[1]],
+            (sg & 4 ? -1 : 1) * w[pm[2]],
+          ]);
+    } else {
+      // POLY: orbit of w under the three diagonal reflections (finite group)
+      const R = [
+        (v) => [-v[1], -v[0], v[2]],
+        (v) => [-v[2], v[1], -v[0]],
+        (v) => [v[0], -v[2], -v[1]],
+      ];
+      const seen = new Map();
+      const key = (v) => v.map((x) => x.toFixed(12)).join(',');
+      const queue = [w];
+      seen.set(key(w), w);
+      while (queue.length && seen.size < 60) {
+        const v = queue.pop();
+        for (const r of R) {
+          const u = r(v);
+          const k = key(u);
+          if (!seen.has(k)) { seen.set(k, u); queue.push(u); }
+        }
+      }
+      cands = [...seen.values()];
+    }
+    // validate candidates through the actual style ops and pick nearest hint
+    let best = null, bestD = Infinity;
+    const tol = 1e-9 * Math.max(1, V.len(w));
+    for (const v of cands) {
+      const r = evalFold(v, { ...P, rot: V.mIdent(), scale: 1, trans: [0, 0, 0] }).x;
+      if (Math.abs(r[0] - w[0]) + Math.abs(r[1] - w[1]) + Math.abs(r[2] - w[2]) > tol) continue;
+      const dd = V.dist(v, h1);
+      if (dd < bestD) { bestD = dd; best = v; }
+    }
+    if (!best) return null;
+    return V.mMulV(V.mTranspose(P.rot), best); // undo rotation
+  }
+
+  /* Wedge normalization: y is outside Fold_j's image. Returns the affine
+     symmetry T (of all levels ≥ j+1) that reflects y back into the image:
+     run the style ops on w=(y-trans)/s until fixed, record linear action. */
+  function wedgeNormalize(y, P) {
+    let w = [(y[0] - P.trans[0]) / P.scale, (y[1] - P.trans[1]) / P.scale, (y[2] - P.trans[2]) / P.scale];
+    let T = V.mIdent();
+    const bare = { ...P, rot: V.mIdent(), scale: 1, trans: [0, 0, 0] };
+    for (let pass = 0; pass < 16; pass++) {
+      const r = evalFold(w, bare, true);
+      const moved = V.dist(r.x, w);
+      T = V.mMul(r.M, T);
+      w = r.x;
+      if (moved < 1e-14) break;
+    }
+    // y-space affine: T(y) = M y + (trans - M trans)
+    const M = T;
+    const b = V.sub(P.trans, V.mMulV(M, P.trans));
+    return { M, b };
+  }
+
+  /* ---- world state ------------------------------------------------------ */
+  class World {
+    constructor(seed, startPos) {
+      this.seed = seed >>> 0;
+      this.K = 0;
+      this.camPos = startPos ? startPos.slice() : [0.6, 1.1, 3.4]; // frame-K, float64
+      this.hints = [];                      // hints[j] = last-known c_j (preimage selector)
+      this.outer = [];                      // per-frame chain, outer[0] = level K-Beff
+      this.W = V.mIdent();
+      this.WScale = 1;
+      this.log10Zoom = 0;
+      this.sunDir = V.norm([0.55, 0.75, 0.35]);
+      this.lights = [];                     // {pos (frame K), col, radius, intensity, level}
+      this.pendingRot = V.mIdent();         // accumulated frame rotation for the renderer's camera basis
+      this._pcache = new Map();
+      this.updateChain();
+    }
+
+    params(j) {
+      let p = this._pcache.get(j);
+      if (!p) { p = LG.levelParams(this.seed, j); this._pcache.set(j, p); }
+      return p;
+    }
+
+    _applyAffine(aff) {
+      // apply a frame-K affine symmetry to everything world-anchored
+      this.camPos = V.add(V.mMulV(aff.M, this.camPos), aff.b);
+      for (const L of this.lights) L.pos = V.add(V.mMulV(aff.M, L.pos), aff.b);
+      this.sunDir = V.norm(V.mMulV(aff.M, this.sunDir));
+      this.pendingRot = V.mMul(this._rotPart(aff.M), this.pendingRot);
+    }
+    _rotPart(M) {
+      const s = Math.cbrt(Math.abs(
+        M[0] * (M[4] * M[8] - M[5] * M[7]) - M[1] * (M[3] * M[8] - M[5] * M[6]) + M[2] * (M[3] * M[7] - M[4] * M[6])
+      )) || 1;
+      return V.mScale(M, 1 / s);
+    }
+
+    /* Rebuild the outer chain from the current camera position. */
+    updateChain() {
+      for (let attempt = 0; attempt < 2 * B_HARD + 4; attempt++) {
+        if (this._tryChain()) return;
+      }
+      // Should be unreachable; keep whatever partial chain we have.
+      console.warn('updateChain: wedge normalization did not settle');
+    }
+
+    _tryChain() {
+      const BH = Math.min(this.K, B_HARD);
+      const full = []; // walked entries, full[b] = level K-1-b
+      const affs = []; // affs[b] = affine of Fold_{K-1-b} at c_{K-1-b} (frame j -> j+1)
+      let cNext = this.camPos;
+      let mag = 1; // Π s over processed levels: frame-j -> frame-K magnification
+      for (let b = 0; b < BH; b++) {
+        const j = this.K - 1 - b;
+        const P = this.params(j);
+        const hint = this.hints[j] || cNext;
+        const pre = foldPreimage(cNext, P, hint);
+        if (!pre) {
+          // Camera exited Fold_j's image: reflect back (symmetry of levels ≥ j+1),
+          // lifted from frame j+1 to frame K through the already-known affines,
+          // transforming each frame's chain hint on the way up.
+          let T = wedgeNormalize(cNext, P);
+          for (let bb = b - 1; bb >= 0; bb--) {
+            const m = this.K - 1 - bb; // T is currently expressed in frame m
+            if (this.hints[m]) this.hints[m] = V.add(V.mMulV(T.M, this.hints[m]), T.b);
+            const A = affs[bb]; // frame m -> m+1
+            const invAM = V.mInv(A.M);
+            const M = V.mMul(A.M, V.mMul(T.M, invAM));
+            const tb = V.add(V.mMulV(A.M, V.add(V.mMulV(T.M, V.mMulV(invAM, V.scale(A.b, -1))), T.b)), A.b);
+            T = { M, b: tb };
+          }
+          this._applyAffine(T);
+          return false; // restart the walk with the corrected camera
+        }
+        const r = evalFold(pre, P, true);
+        mag *= P.scale;
+        full.push({
+          level: j, c: pre, M: r.M, margin: Math.max(0, r.margin * 0.999),
+          scale: P.scale, crossing: r.margin * mag,
+        });
+        affs.push({ M: r.M, b: V.sub(r.x, V.mMulV(r.M, pre)) });
+        this.hints[j] = pre;
+        cNext = pre;
+      }
+      // Window size: keep at least B_MIN levels, and keep any older level whose
+      // fold boundaries pass within the horizon (dropping it would visibly
+      // change near geometry).
+      let Beff = Math.min(this.K, B_MIN);
+      for (let b = full.length - 1; b >= Beff; b--) {
+        if (full[b].crossing < HORIZON * 2) { Beff = b + 1; break; }
+      }
+      this.outer.length = 0;
+      let W = V.mIdent();
+      let WScale = 1;
+      for (let b = 0; b < Beff; b++) {
+        this.outer.unshift(full[b]);
+        W = V.mMul(V.mInv(full[b].M), W);
+        WScale /= full[b].scale;
+      }
+      this.W = W;
+      this.WScale = WScale;
+      // Attractor bounding radius over the whole active window: the invariant
+      // ball satisfies R >= |t_j|/(s_j - 1) for every level. The DE formula
+      // (|x| - R)/dr is a rigorous lower bound for ANY truncation depth
+      // (cone-break LOD, escape), which is what keeps coarse LOD hole-free.
+      let bound = 2.0;
+      for (let j = Math.max(0, this.K - this.outer.length); j <= this.K + N_INNER; j++) {
+        const P = this.params(j);
+        const t = Math.hypot(P.trans[0], P.trans[1], P.trans[2]);
+        bound = Math.max(bound, t / (P.scale - 1));
+      }
+      this.bound = bound * 1.05;
+      return true;
+    }
+
+    /* Float64 distance estimator at frame-K point p (absolute frame-K coords). */
+    de(p) {
+      let x, dr;
+      let escaped = false;
+      if (this.outer.length) {
+        const d = V.mMulV(this.W, V.sub(p, this.camPos));
+        x = V.add(this.outer[0].c, d);
+        dr = this.WScale;
+        for (let b = 0; b < this.outer.length; b++) {
+          x = evalFold(x, this.params(this.outer[b].level)).x;
+          dr *= this.outer[b].scale;
+          if (V.dot(x, x) > ESCAPE2) { escaped = true; break; }
+        }
+      } else {
+        x = p.slice();
+        dr = 1;
+      }
+      if (!escaped) {
+        for (let i = 0; i < N_INNER; i++) {
+          x = evalFold(x, this.params(this.K + i)).x;
+          dr *= this.params(this.K + i).scale;
+          if (V.dot(x, x) > ESCAPE2) break;
+        }
+      }
+      return (V.len(x) - this.bound) / dr;
+    }
+
+    grad(p, h) {
+      h = h || Math.max(1e-9, Math.abs(this.de(p)) * 1e-3);
+      return V.norm([
+        this.de([p[0] + h, p[1], p[2]]) - this.de([p[0] - h, p[1], p[2]]),
+        this.de([p[0], p[1] + h, p[2]]) - this.de([p[0], p[1] - h, p[2]]),
+        this.de([p[0], p[1], p[2] + h]) - this.de([p[0], p[1], p[2] - h]),
+      ]);
+    }
+
+    /* ---- rebasing -------------------------------------------------------- */
+    descend() {
+      const P = this.params(this.K);
+      const r = evalFold(this.camPos, P, true);
+      this.hints[this.K] = this.camPos;
+      const s = P.scale, s2 = s * s;
+      // x s^2 keeps the rebase photometrically EXACT (no blink); the age fade
+      // is applied continuously at upload time in gpuLights().
+      for (const L of this.lights) {
+        L.pos = evalFold(L.pos, P).x;
+        L.radius *= s;
+        L.intensity *= s2;
+      }
+      this.sunDir = V.norm(V.mMulV(r.M, this.sunDir));
+      this.pendingRot = V.mMul(this._rotPart(r.M), this.pendingRot);
+      this.camPos = r.x;
+      this.K++;
+      this.log10Zoom += Math.log10(s);
+      this._spawnLight();
+      this._pruneLights();
+      this.updateChain();
+    }
+
+    ascend() {
+      if (this.K <= 0) return false;
+      const P = this.params(this.K - 1);
+      let pre = foldPreimage(this.camPos, P, this.hints[this.K - 1] || this.camPos);
+      if (!pre) {
+        this._applyAffine(wedgeNormalize(this.camPos, P));
+        pre = foldPreimage(this.camPos, P, this.hints[this.K - 1] || this.camPos);
+        if (!pre) return false; // shouldn't happen
+      }
+      const r = evalFold(pre, P, true); // exact affine at the preimage
+      const invM = V.mInv(r.M);
+      const s = P.scale, s2 = s * s;
+      const bb = V.sub(r.x, V.mMulV(r.M, pre));
+      for (const L of this.lights) {
+        L.pos = V.mMulV(invM, V.sub(L.pos, bb));
+        L.radius /= s;
+        L.intensity /= s2;
+      }
+      this.sunDir = V.norm(V.mMulV(invM, this.sunDir));
+      this.pendingRot = V.mMul(this._rotPart(invM), this.pendingRot);
+      this.camPos = pre;
+      this.K--;
+      this.log10Zoom -= Math.log10(s);
+      this._pruneLights();
+      this.updateChain();
+      return true;
+    }
+
+    /* Keep the camera's local scale in a fixed band by rebasing. Returns DE. */
+    rebaseToCamera() {
+      let d = this.de(this.camPos);
+      let guard = 0;
+      while (d < DESCEND_DE && guard++ < 6) {
+        this.descend();
+        d = this.de(this.camPos);
+      }
+      while (this.K > 0 && guard++ < 12) {
+        const sPrev = this.params(this.K - 1).scale;
+        if (d < DESCEND_DE * sPrev * 2.1) break;
+        if (!this.ascend()) break;
+        d = this.de(this.camPos);
+      }
+      return d;
+    }
+
+    // Renderer support: consume the accumulated frame rotation (reflections /
+    // rotations from rebases and wedge corrections) to keep the view basis
+    // pointing at the same physical scene.
+    takeFrameRotation() {
+      const r = this.pendingRot;
+      this.pendingRot = V.mIdent();
+      return r;
+    }
+
+    /* ---- lights ---------------------------------------------------------- */
+    _spawnLight() {
+      const P = this.params(this.K);
+      if (!P.light.spawn) return;
+      if (this.lights.some((L) => L.level === this.K)) return;
+      const g = this.grad(this.camPos);
+      const o = P.light.off;
+      const pos = V.add(this.camPos, V.add(V.scale(g, 0.9), V.scale(o, 0.9)));
+      this.lights.push({
+        pos, col: P.light.col, radius: 0.035, intensity: P.light.intensity,
+        level: this.K, spawnZoom: this.log10Zoom,
+      });
+    }
+    _pruneLights() {
+      // beyond ~1e4 units the fog extinction makes a light invisible
+      this.lights = this.lights.filter(
+        (L) => L.radius > 2e-4 && L.radius < 1.5e4 && V.dist(L.pos, this.camPos) < 2.5e4
+      );
+      if (this.lights.length > MAX_LIGHTS_STORED)
+        this.lights.splice(0, this.lights.length - MAX_LIGHTS_STORED);
+    }
+
+    /* ---- GPU upload ------------------------------------------------------- */
+    /* UBO layout (std140, all vec4):
+         vec4 lvl[SLOTS*6]  — per level slot: rotCol0(w=scale), rotCol1(w=style),
+                              rotCol2(w=foldL), trans(w=emissive), pal(w=margin*),
+                              spare — see packUBO for exact packing
+         vec4 outer[B_HARD*4] — per outer slot: jacCol0, jacCol1, jacCol2, (c.xyz, margin)
+       Slot i covers absolute level (K - Beff + i).                            */
+    packUBO(buf) {
+      const B = this.outer.length;
+      const f = buf;
+      for (let i = 0; i < SLOTS; i++) {
+        const j = this.K - B + i;
+        const P = this.params(Math.max(0, j));
+        const o = i * 6 * 4;
+        const rc = V.mToCols(P.rot);
+        f[o + 0] = rc[0]; f[o + 1] = rc[1]; f[o + 2] = rc[2]; f[o + 3] = P.scale;
+        f[o + 4] = rc[3]; f[o + 5] = rc[4]; f[o + 6] = rc[5]; f[o + 7] = P.style;
+        f[o + 8] = rc[6]; f[o + 9] = rc[7]; f[o + 10] = rc[8]; f[o + 11] = P.foldL;
+        f[o + 12] = P.trans[0]; f[o + 13] = P.trans[1]; f[o + 14] = P.trans[2]; f[o + 15] = P.emissive;
+        f[o + 16] = P.pal[0]; f[o + 17] = P.pal[1]; f[o + 18] = P.pal[2]; f[o + 19] = 0;
+        f[o + 20] = 0; f[o + 21] = 0; f[o + 22] = 0; f[o + 23] = 0;
+      }
+      const base = SLOTS * 6 * 4;
+      for (let b = 0; b < B_HARD; b++) {
+        const o = base + b * 4 * 4;
+        if (b < B) {
+          const E = this.outer[b];
+          const jc = V.mToCols(E.M);
+          f[o + 0] = jc[0]; f[o + 1] = jc[1]; f[o + 2] = jc[2]; f[o + 3] = 0;
+          f[o + 4] = jc[3]; f[o + 5] = jc[4]; f[o + 6] = jc[5]; f[o + 7] = 0;
+          f[o + 8] = jc[6]; f[o + 9] = jc[7]; f[o + 10] = jc[8]; f[o + 11] = 0;
+          f[o + 12] = E.c[0]; f[o + 13] = E.c[1]; f[o + 14] = E.c[2]; f[o + 15] = E.margin;
+        } else {
+          for (let k = 0; k < 16; k++) f[o + k] = 0;
+        }
+      }
+      return f;
+    }
+
+    /* Sky/fog mood, CONTINUOUS in depth: K plus fractional progress through
+       the level inferred from the camera's DE (descend fires at DESCEND_DE,
+       right after which DE ≈ DESCEND_DE * s). Discrete-K moods pop at every
+       rebase. */
+    mood(deCam) {
+      const sK = this.params(this.K).scale;
+      const de = Math.max(deCam || DESCEND_DE * sK, 1e-12);
+      const f = Math.log((DESCEND_DE * sK) / de) / Math.log(sK);
+      const D = this.K + f;
+      const j0 = Math.max(0, Math.floor(D));
+      const fr = Math.min(1, Math.max(0, D - j0));
+      const a = this.params(j0).biome;
+      const b = this.params(j0 + 1).biome;
+      return { sky: V.lerp(a.sky, b.sky, fr), fog: V.lerp(a.fog, b.fog, fr) };
+    }
+
+    /* Continuous depth in log10 units (K progress inferred from camera DE),
+       shared by mood() and the light age fade. */
+    depthZoom(deCam) {
+      const sK = this.params(this.K).scale;
+      const de = Math.max(deCam || DESCEND_DE * sK, 1e-12);
+      // exactly continuous across rebase: de scales by s as log10Zoom gains log10(s)
+      const dz = Math.min(1.2, Math.max(-1.2, Math.log10(de / DESCEND_DE)));
+      return this.log10Zoom - dz;
+    }
+
+    gpuLights(deCam) {
+      const Z = this.depthZoom(deCam);
+      const scored = this.lights.map((L) => {
+        const d = Math.max(V.dist(L.pos, this.camPos), L.radius);
+        // age fade: apparent brightness ~ (total zoom growth since spawn)^-0.8,
+        // continuous in depth so rebases never blink
+        const fade = Math.pow(10, -0.8 * Math.max(0, Z - L.spawnZoom));
+        const eff = L.intensity * fade;
+        return { L, eff, s: (eff / (d * d)) * Math.exp(-d * 2.5e-4) };
+      });
+      scored.sort((a, b) => b.s - a.s);
+      return scored.slice(0, MAX_LIGHTS_GPU).map((x) => ({ ...x.L, intensity: x.eff }));
+    }
+  }
+
+  const WorldMod = {
+    World, evalFold, foldPreimage, wedgeNormalize,
+    B_HARD, B_MIN, HORIZON, N_INNER, SLOTS, DESCEND_DE, ESCAPE2, MAX_LIGHTS_GPU,
+  };
+  global.WorldMod = WorldMod;
+  if (typeof module !== 'undefined' && module.exports) module.exports = WorldMod;
+})(typeof window !== 'undefined' ? window : globalThis);
