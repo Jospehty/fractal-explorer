@@ -21,11 +21,13 @@
   #define MAX_LIGHTS ${WM.MAX_LIGHTS_GPU}
   #define ICO_N vec3(${WM.ICO_N.map((v) => v.toFixed(10)).join(', ')})
   #define OV ${WM.OUTER_VEC4}
+  #define LV ${WM.LVL_VEC4}
   #define ABS_REL2 ${WM.ABS_REL2.toExponential(4)}
   `;
 
-  /* Look-development constants (lighting balance / grade). Overridable for
-     tuning via the URL: ?look={"fill":0.5,...} (see main.js). */
+  /* Look constants (lighting balance / grade) — uploaded as uniforms
+     (uLookA..D), so photo mode can change them live. Overridable for
+     look-dev via the URL: ?look={"fill":0.5,...} (see main.js). */
   const LOOK_DEFAULTS = {
     exposure: 1.4,   // pre-tonemap exposure
     sun: 1.0,        // key light (sun) strength
@@ -37,9 +39,14 @@
     rim: 1.6,        // haze rim on grazing surfaces
     sat: 1.3,        // albedo saturation
     huePreserve: 0.5,// 0 = plain ACES (bleaches bright colors), 1 = hue-preserving
+    albHue: 0,       // surface hue rotation (turns) — photo mode
+    glow: 1,         // emissive vein strength
+    vignette: 0.22,
+    hazeMul: 1,      // haze density multiplier — photo mode
+    hazeHue: 0,      // sky/haze hue rotation (turns) — photo mode
+    customSun: false,// photo mode: place the sun yourself
+    sunAz: 40, sunEl: 35, sunHue: 0.09, sunTint: 0.4,
   };
-  const look = () => Object.assign({}, LOOK_DEFAULTS, global.__LOOK || {});
-  const F = (v) => Number(v).toFixed(5);
 
   /* Outer phase, generated inline into map() and mapDE() (a shared GLSL
      function with inout state was measured ~2.4x slower: it put the escape
@@ -57,7 +64,7 @@
         if (b >= uB) break;
         vec4 cm = outerData[b*OV+3];
         float dd = dot(d, d);
-        dr *= lvl[b*6].w;
+        dr *= lvl[b*LV].w;
         if (dd < cm.w * cm.w) {
           d = mat3(outerData[b*OV].xyz, outerData[b*OV+1].xyz, outerData[b*OV+2].xyz) * d;
           ${trapHook ? '{ vec3 xs = ((b + 1 < uB) ? outerData[(b+1)*OV+3].xyz : uCamK) + d; ' + trapHook + ' }' : ''}
@@ -67,13 +74,14 @@
         if (dd > ABS_REL2 * max(dot(cm.xyz, cm.xyz), 1.0)) {
           x = foldLevel(cm.xyz + d, b);
           bAbs = b;
+          sl = b;
           if (dot(x, x) > ESCAPE2) esc = true;
           ${trapHook ? '{ vec3 xs = x; ' + trapHook + ' }' : ''}
           break;
         } else {
           ${perturb ? 'd = foldDelta(d, b);' : 'd = foldLevel(cm.xyz + d, b) - cn; /* fast variant: unreachable unless world.needsPerturb */'}
           vec3 xe = cn + d;
-          if (dot(xe, xe) > ESCAPE2) { x = xe; esc = true; break; }
+          if (dot(xe, xe) > ESCAPE2) { x = xe; esc = true; sl = b; break; }
         }
         ${trapHook ? '{ vec3 xs = cn + d; ' + trapHook + ' }' : ''}
       }
@@ -83,7 +91,8 @@
           if (b <= bAbs) continue;
           if (b >= uB) break;
           x = foldLevel(x, b);
-          dr *= lvl[b*6].w;
+          dr *= lvl[b*LV].w;
+          sl = b;
           if (dot(x, x) > ESCAPE2) { esc = true; break; }
           ${trapHook ? '{ vec3 xs = x; ' + trapHook + ' }' : ''}
         }
@@ -97,7 +106,7 @@
      and the two variants render identically. Its mere presence costs ~40%
      march speed (register pressure), so the renderer keeps both programs
      and picks per frame. */
-  const FRAG = (WM, opts) => { const L = look(); const PERT = !(opts && opts.perturb === false); return `#version 300 es
+  const FRAG = (WM, opts) => { const PERT = !(opts && opts.perturb === false); return `#version 300 es
   precision highp float;
   precision highp int;
   ${DEFS(WM)}
@@ -121,9 +130,13 @@
   uniform vec4  uLightCol[MAX_LIGHTS]; // rgb, w = intensity
   uniform int   uQuality;    // 0 low, 1 medium, 2 high
   uniform float uGlowAmt;
-  uniform float uBound;
   uniform vec2  uJitter;     // sub-pixel jitter for still-frame accumulation
   uniform float uHaze;       // haze extinction per decade of distance (mood)
+  // Look / photo-mode controls (renderer.look, see LOOK_DEFAULTS):
+  uniform vec4  uLookA;      // exposure, sun strength, sun tint, sky fill
+  uniform vec4  uLookB;      // ground fill, bounce, headlight, haze rim
+  uniform vec4  uLookC;      // albedo saturation, hue-preserving tonemap, albedo hue shift (turns), vein glow
+  uniform vec4  uLookD;      // detail (LOD/hit footprint, 1 = live), vignette, step budget scale, -
   uniform mat3  uSkyBasis;   // WORLD axes in frame-K coords (world.skyBasis):
                              // "up" and the star field ride it so they never
                              // jump when a rebase re-charts the frame
@@ -133,13 +146,16 @@
                              // continuous across the rebase rescale
 
   layout(std140) uniform Params {
-    vec4 lvl[SLOTS * 6];        // per slot: rot0(w=scale) rot1(w=style) rot2(w=foldL) trans(w=emissive) pal foldOff
+    vec4 lvl[SLOTS * LV];       // per slot (LV=7): rot0(w=scale) rot1(w=style) rot2(w=foldL|n) trans(w=emissive) pal(w=accent) foldOff|N2(w=glow hue) (bound after level)
     vec4 outerData[B_HARD * OV]; // per outer: jac0 jac1 jac2 (c.xyz, margin) stages0-3 stages4-7
   };
 
+  // attractor bounding radius after slot s's fold (world.js boundAfter)
+  float bnd(int s) { return lvl[s*LV+6].x; }
+
   /* ---- the fold (mirror of world.js evalFold) ---- */
   vec3 foldLevel(vec3 x, int s) {
-    vec4 r0 = lvl[s*6+0], r1 = lvl[s*6+1], r2 = lvl[s*6+2], tr = lvl[s*6+3];
+    vec4 r0 = lvl[s*LV+0], r1 = lvl[s*LV+1], r2 = lvl[s*LV+2], tr = lvl[s*LV+3];
     x = mat3(r0.xyz, r1.xyz, r2.xyz) * x;
     float style = r1.w;
     if (style < 0.5) {            // POLY: diagonal plane folds
@@ -147,21 +163,31 @@
       if (x.x + x.z < 0.0) x.xz = -x.zx;
       if (x.y + x.z < 0.0) x.yz = -x.zy;
     } else if (style < 1.5) {     // MENGER: offset abs + sort desc
-      vec3 fo = lvl[s*6+5].xyz;
+      vec3 fo = lvl[s*LV+5].xyz;
       x = fo + abs(x - fo);
       if (x.x < x.y) x.xy = x.yx;
       if (x.x < x.z) x.xz = x.zx;
       if (x.y < x.z) x.yz = x.zy;
     } else if (style < 2.5) {     // OCTA: offset abs + partial sort
-      vec3 fo = lvl[s*6+5].xyz;
+      vec3 fo = lvl[s*LV+5].xyz;
       x = fo + abs(x - fo);
       if (x.x < x.y) x.xy = x.yx;
       if (x.y < x.z) x.yz = x.zy;
-    } else {                      // ICOSA: H3 kaleidoscope, 2x (abs + golden plane)
+    } else if (style < 3.5) {     // ICOSA: H3 kaleidoscope, 2x (abs + golden plane)
       x = abs(x);
       x -= 2.0 * min(0.0, dot(x, ICO_N)) * ICO_N;
       x = abs(x);
       x -= 2.0 * min(0.0, dot(x, ICO_N)) * ICO_N;
+    } else {                      // DIHEDRAL: z mirror + D_n wedge (alternating mirrors)
+      x.z = abs(x.z);
+      vec3 n2 = lvl[s*LV+5].xyz;
+      int nOps = int(r2.w + 0.5);
+      nOps = (nOps & 1) == 1 ? nOps : nOps + 1;
+      for (int k = 0; k < 7; k++) {
+        if (k >= nOps) break;
+        if ((k & 1) == 0) x.y = abs(x.y);   // N1 = y=0 plane (exact)
+        else x -= 2.0 * min(0.0, dot(x, n2)) * n2;
+      }
     }
     return x * r0.w + tr.xyz;
   }
@@ -190,14 +216,15 @@
     if (ref) return vec2(Sg + dab.x, Sg + dab.y);
     return dab;
   }
-  vec3 goldOp(vec3 d, float Tn) {        // golden-plane reflection, Tn = ref x·N
-    float dn = dot(d, ICO_N);
+  vec3 planeOp(vec3 d, float Tn, vec3 N) { // "if x·N < 0 reflect", Tn = ref x·N
+    float dn = dot(d, N);
     bool ref = Tn < 0.0, pix = Tn + dn < 0.0;
     float f = (ref && pix) ? -2.0 * dn : (pix ? -2.0 * (Tn + dn) : (ref ? 2.0 * Tn : 0.0));
-    return d + f * ICO_N;
+    return d + f * N;
   }
+  vec3 goldOp(vec3 d, float Tn) { return planeOp(d, Tn, ICO_N); } // golden plane
   vec3 foldDelta(vec3 d, int b) {
-    vec4 r0 = lvl[b*6+0], r1 = lvl[b*6+1], r2 = lvl[b*6+2];
+    vec4 r0 = lvl[b*LV+0], r1 = lvl[b*LV+1], r2 = lvl[b*LV+2];
     d = mat3(r0.xyz, r1.xyz, r2.xyz) * d;
     float style = r1.w;
     if (style < 0.5) {            // POLY
@@ -213,11 +240,21 @@
       } else {
         d.yz = swapOp(d.yz, stg(b, 4));
       }
-    } else {                      // ICOSA
+    } else if (style < 3.5) {     // ICOSA
       absOp(d.x, stg(b, 0)); absOp(d.y, stg(b, 1)); absOp(d.z, stg(b, 2));
       d = goldOp(d, stg(b, 3));
       absOp(d.x, stg(b, 4)); absOp(d.y, stg(b, 5)); absOp(d.z, stg(b, 6));
       d = goldOp(d, stg(b, 7));
+    } else {                      // DIHEDRAL
+      absOp(d.z, stg(b, 0));
+      vec3 n2 = lvl[b*LV+5].xyz;
+      int nOps = int(r2.w + 0.5);
+      nOps = (nOps & 1) == 1 ? nOps : nOps + 1;
+      for (int k = 0; k < 7; k++) {
+        if (k >= nOps) break;
+        if ((k & 1) == 0) absOp(d.y, stg(b, k + 1)); // y=0 mirror == abs on y
+        else d = planeOp(d, stg(b, k + 1), n2);
+      }
     }
     return d * r0.w;
   }
@@ -250,7 +287,7 @@
      viewing distance (root-level veins used to paint whole colossal surfaces
      in glow). */
   vec3 veinGlow(int s, vec3 xs, float dr, float tView, float pixT) {
-    float em = lvl[s*6+3].w;
+    float em = lvl[s*LV+3].w;
     if (em <= 0.0) return vec3(0.0);
     float w = 0.008 / dr;                        // vein core width, frame-K units
     float fade = smoothstep(0.8, 2.5, w / pixT)  // resolvable (pixels)
@@ -260,7 +297,7 @@
     float dpl = abs(xs.z + 0.4 * xs.x - 0.35);
     float v = smoothstep(0.006, 0.0, dpl) + 0.35 * exp(-dpl * 90.0);
     // vivid glow color from the level's glow hue (sat 0.8)
-    float h = lvl[s*6+5].w;
+    float h = lvl[s*LV+5].w;
     vec3 c = clamp(abs(fract(h + vec3(0.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0, 0.0, 1.0);
     c = mix(vec3(1.0), c, 0.8);
     return c * (em * v * fade * 0.6);
@@ -269,6 +306,7 @@
   float map(vec3 p, float coneEps, float tView, out vec4 trapOut, out vec3 glow) {
     vec3 x = vec3(0.0);
     float dr;
+    int sl = uB; // slot of the last fold applied (selects the bounding radius)
     bool esc = false;
     float m1 = 1e9, m2 = 1e9;            // two smallest traps
     float s1 = float(uB), s2 = float(uB); // and their slots
@@ -292,7 +330,8 @@
       for (int i = 0; i < N_INNER; i++) {
         int s = uB + i;
         x = foldLevel(x, s);
-        dr *= lvl[s*6].w;
+        dr *= lvl[s*LV].w;
+        sl = s;
         float xx2 = dot(x, x);
         float m = sqrt(xx2) * 0.9 + 0.12 * abs(x.y) // slight anisotropy for banding
                 + trapPenalty(dr, tView);
@@ -306,8 +345,9 @@
     trapOut = vec4(s1, m1, s2, m2);
     glow = glowAcc;
     // (|x| - R)/dr is a rigorous distance lower bound for any truncation depth
-    // (R = attractor bounding radius, uploaded per frame) — hole-free LOD.
-    return (length(x) - uBound) / dr;
+    // (R = bounding radius of the attractor after the last applied level,
+    // per absolute level — see world.js boundAfter) — hole-free LOD.
+    return (length(x) - bnd(sl)) / dr;
   }
 
   /* Distance-only variant used for ALL marching, normal, AO and shadow
@@ -320,6 +360,7 @@
   float mapDE(vec3 p, float coneEps) {
     vec3 x = vec3(0.0);
     float dr;
+    int sl = uB;
     bool esc = false;
     // skip the leading outer levels this sample is linear through: R_b is
     // nonincreasing, so count while |p| < R_b (see world.js, per-level skip)
@@ -349,7 +390,8 @@
       for (int i = 0; i < N_INNER; i++) {
         int s = uB + i;
         x = foldLevel(x, s);
-        dr *= lvl[s*6].w;
+        dr *= lvl[s*LV].w;
+        sl = s;
         if (dot(x, x) > ESCAPE2) break;
         ${global.__SHADER_DEBUG === 'nocone' ? '' : `
         if (1.0 < dr * coneEps) {
@@ -359,15 +401,15 @@
           // position. Both are rigorous lower bounds for any truncation
           // depth, so the mix is hole-free.
           int s2 = min(s + 1, SLOTS - 1);
-          float sc = lvl[s2*6].w;
+          float sc = lvl[s2*LV].w;
           float f = clamp((dr * coneEps - 1.0) / max(sc - 1.0, 0.1), 0.0, 1.0);
-          float deA = (length(x) - uBound) / dr;
-          float deB = (length(foldLevel(x, s2)) - uBound) / (dr * sc);
+          float deA = (length(x) - bnd(s)) / dr;
+          float deB = (length(foldLevel(x, s2)) - bnd(s2)) / (dr * sc);
           return mix(deB, deA, f);
         }`}
       }
     }
-    return (length(x) - uBound) / dr;
+    return (length(x) - bnd(sl)) / dr;
   }
 
   float mapD(vec3 p, float coneEps) { return mapDE(p, coneEps); }
@@ -386,7 +428,9 @@
     float t = t0;
     for (int i = 0; i < 64; i++) {
       if (i >= steps || t >= tmax) break;
-      float h = mapD(ro + rd * t, coneEps + t * 2e-3);
+      // LOD cone widens along the ray: a soft penumbra cannot resolve fine
+      // detail far from the surface, and coarser DE evaluations are cheaper
+      float h = mapD(ro + rd * t, coneEps + t * 0.015);
       if (h < 1e-6 * t) return 0.0;
       res = min(res, k * h / t);
       if (res < 0.015) return 0.0; // effectively occluded: stop paying
@@ -399,13 +443,14 @@
 
   float calcAO(vec3 p, vec3 n, float scale, float coneEps) {
     float occ = 0.0, sca = 1.0;
-    for (int i = 0; i < 5; i++) {
-      float h = (0.01 + 0.13 * float(i)) * scale;
+    // 4 taps spanning the same radius as the old 5 (weights renormalized)
+    for (int i = 0; i < 4; i++) {
+      float h = (0.01 + 0.173 * float(i)) * scale;
       float d = mapD(p + n * h, coneEps + h * 0.2);
       occ += (h - d) * sca / scale;
-      sca *= 0.72;
+      sca *= 0.66;
     }
-    return clamp(1.0 - 2.2 * occ, 0.0, 1.0);
+    return clamp(1.0 - 2.5 * occ, 0.0, 1.0);
   }
 
   /* analytic inscatter of a point light along the ray (closed form) */
@@ -461,8 +506,8 @@
     return c * ca + cross(k, c) * sin(a) + k * dot(k, c) * (1.0 - ca);
   }
 
-  vec3 palette(int slot) { return lvl[slot*6+4].rgb; }
-  float accentOf(int slot) { return lvl[slot*6+4].w; }
+  vec3 palette(int slot) { return lvl[slot*LV+4].rgb; }
+  float accentOf(int slot) { return lvl[slot*LV+4].w; }
 
   vec3 aces(vec3 x) {
     return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
@@ -492,7 +537,10 @@
     // visible (as hazy colossi). Coupled to world.js HORIZON — see there.
     const float TMAX = 1.0e11;
     float tmax = TMAX / uFogMul; // effective horizon, continuous across rebases
-    int   MAXSTEP = uQuality == 0 ? 100 : (uQuality == 1 ? 150 : 210);
+    int   MAXSTEP = int(float(uQuality == 0 ? 100 : (uQuality == 1 ? 150 : 210)) * uLookD.z);
+    // detail < 1 (still-frame refinement): finer LOD and hit footprint, so a
+    // held frame resolves smoothed/blobby far detail into real structure
+    float detail = uLookD.x;
     float t = 0.0;
     float d = 0.0;
     vec4 trap = vec4(0.0);
@@ -500,16 +548,28 @@
     bool hit = false;
     bool exhausted = false;
     int steps = 0;
-    for (int i = 0; i < 256; i++) {
+    /* Over-relaxed sphere tracing (Keinert et al. 2014): step 1.25x the
+       safe distance while consecutive unbounding spheres overlap; if they
+       stop overlapping the long step may have skipped geometry, so fall back
+       to the safe step from the previous point and stay conservative. Same
+       surfaces, ~20-30% fewer steps in open space and along walls. */
+    float omega = 1.25, tPrev = 0.0, dPrev = 0.0;
+    for (int i = 0; i < 512; i++) {
       if (t > tmax) break;
       if (i >= MAXSTEP) { hit = true; exhausted = true; break; } // grazing geometry
       steps = i;
       vec3 p = ro + rd * t;
-      d = mapDE(p, t * pix * 0.22); // trap-free marching; traps sampled at hit
-      if (d < t * pix * 0.45 + 2e-6) { hit = true; break; }
-      t += min(d, tmax * 0.5) * 0.92;
+      d = mapDE(p, t * pix * 0.22 * detail); // trap-free marching; traps sampled at hit
+      if (omega > 1.0 && d + dPrev < (t - tPrev) * 1.0001) {
+        t = tPrev + min(dPrev, tmax * 0.5) * 0.92;
+        omega = 1.0;
+        continue;
+      }
+      if (d < t * pix * 0.45 * detail + 2e-6) { hit = true; break; }
+      tPrev = t; dPrev = d;
+      t += min(d, tmax * 0.5) * 0.92 * omega;
     }
-    if (hit) map(ro + rd * t, t * pix * 0.22, t, trap, veins); // orbit traps for shading
+    if (hit) map(ro + rd * t, t * pix * 0.22 * detail, t, trap, veins); // orbit traps for shading
     ${global.__SHADER_DEBUG === 'stats'
       ? `fragColor = vec4(clamp(log2(t + 1.0) / 15.0, 0.0, 1.0),
                           float(steps) / float(MAXSTEP), hit ? 1.0 : 0.0, 1.0); return;`
@@ -523,8 +583,8 @@
     float fogT = min(t, tmax);
     if (hit) {
       vec3 p = ro + rd * t;
-      float coneEps = t * pix * 0.22;
-      float eps = max(t * pix * 0.4, 2e-6);
+      float coneEps = t * pix * 0.22 * detail;
+      float eps = max(t * pix * 0.4 * detail, 2e-6);
       vec3 n = calcNormal(p, eps, coneEps);
       if (dot(n, rd) > 0.0) n = -n;
 
@@ -546,7 +606,8 @@
       // trap-based tone variation: crevices darken, ridges lighten
       float tv = clamp(trap.y * 0.7, 0.0, 1.4);
       alb *= 0.4 + 0.65 * tv;
-      alb = max(mix(vec3(dot(alb, vec3(0.299, 0.587, 0.114))), alb, ${F(L.sat)}), 0.0);
+      alb = max(mix(vec3(dot(alb, vec3(0.299, 0.587, 0.114))), alb, uLookC.x), 0.0);
+      if (uLookC.z != 0.0) alb = max(hueRot(alb, uLookC.z), 0.0); // photo mode color shift
       vec3 up = uSkyBasis[1];
 
       // NOTE every absolute length here divides by uFogMul (or multiplies,
@@ -577,19 +638,19 @@
          partly desaturated on surfaces: a strongly tinted sun times a
          complementary albedo just turns every lit face grey.
          ("up" is world-anchored via the sky basis — see uSkyBasis) */
-      vec3 sunLit = mix(vec3(dot(uSunCol, vec3(0.333))), uSunCol, ${F(L.sunSat)});
-      vec3 hemi = mix(uFogCol * ${F(L.ground)}, uSkyCol, 0.5 + 0.5 * dot(n, up));
-      vec3 amb = hemi * ${F(L.fill)} * 4.0 * (ao2 * 0.85 + 0.15);
-      amb += sunLit * ${F(L.bounce)} * max(0.0, -dot(n, uSunDir)) * ao;
-      col = alb * (amb + sunLit * sunDiff * sh * ${F(L.sun)});
+      vec3 sunLit = mix(vec3(dot(uSunCol, vec3(0.333))), uSunCol, uLookA.z);
+      vec3 hemi = mix(uFogCol * uLookB.x, uSkyCol, 0.5 + 0.5 * dot(n, up));
+      vec3 amb = hemi * uLookA.w * 4.0 * (ao2 * 0.85 + 0.15);
+      amb += sunLit * uLookB.y * max(0.0, -dot(n, uSunDir)) * ao;
+      col = alb * (amb + sunLit * sunDiff * sh * uLookA.y);
       col += sunLit * spec * sh * sunDiff;
       // headlight: soft camera-attached fill so unlit caves stay readable
       float head = max(dot(n, -rd), 0.0);
       float tf = t * uFogMul; // scale-continuous distance for the falloff
-      col += alb * (${F(L.head)} * head * head * ao / (1.0 + tf * tf * 0.20));
+      col += alb * (uLookB.z * head * head * ao / (1.0 + tf * tf * 0.20));
       // rim: grazing surfaces pick up the haze behind them, so dark shapes
       // keep readable silhouettes against the glow instead of merging
-      col += hazeColor(rd) * pow(1.0 - head, 4.0) * ${F(L.rim)} * (0.3 + 0.7 * ao);
+      col += hazeColor(rd) * pow(1.0 - head, 4.0) * uLookB.w * (0.3 + 0.7 * ao);
 
       vec3 dbgBase = col;
       // point lights: POOLS, not floodlights — the clamp is well below sun
@@ -621,7 +682,7 @@
       // emissive veins: accumulated per level in map() with a scale window
       // (veinGlow), so they appear as you approach and never wash or speckle
       ${global.__SHADER_DEBUG === 'noemis' ? '' : `
-      col += veins * (0.55 + 0.45 * ao);
+      col += veins * (0.55 + 0.45 * ao) * uLookC.w;
       `}
       dbgLights = col - dbgBase;
     } else {
@@ -673,13 +734,13 @@
     ${global.__SHADER_DEBUG === 'terms2' ? 'fragColor = vec4(dot(dbgLights, vec3(0.33)), dot(col, vec3(0.33)) * 0.5, hit ? 0.2 : 0.8, 1.0); return;' : ''}
     // tonemap: ACES, partly hue-preserving (plain ACES bleaches saturated
     // brights toward white — the "pale mint" look)
-    col *= ${F(L.exposure)};
+    col *= uLookA.x;
     float lumIn = max(dot(col, vec3(0.2126, 0.7152, 0.0722)), 1e-6);
     vec3 tmHue = col * (aces(vec3(lumIn)).x / lumIn);
-    col = clamp(mix(aces(col), tmHue, ${F(L.huePreserve)}), 0.0, 1.0);
+    col = clamp(mix(aces(col), tmHue, uLookC.y), 0.0, 1.0);
     col = pow(col, vec3(1.0 / 2.2));
     // vignette + dither
-    float vig = 1.0 - 0.22 * dot(uv * 0.62, uv * 0.62);
+    float vig = 1.0 - uLookD.y * dot(uv * 0.62, uv * 0.62);
     col *= vig;
     col += (hash12(gl_FragCoord.xy + fract(uTime) * 61.7) - 0.5) / 255.0;
 

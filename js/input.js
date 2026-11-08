@@ -15,6 +15,7 @@
       this.isDragging = false;
       this.onToggle = () => {};   // key callbacks (F, H, P, 1..3, N, R)
       this.touchActive = false;
+      this.suspended = false;     // set by photo mode
       this._touchForward = 0;
       // Removed the click event since mousedown handles it better and avoids target-change cancellation
       document.addEventListener('pointerlockchange', () => {
@@ -22,7 +23,8 @@
         this.onToggle('lock', this.pointerLocked);
       });
       document.addEventListener('mousedown', (e) => {
-        if (e.target.closest('#help')) return;
+        if (e.target.closest('#help') || e.target.closest('#photo')) return;
+        if (this.suspended) return; // photo mode: the mouse stays free
         if (!this.pointerLocked && !this.touchActive) canvas.requestPointerLock();
         if (e.button === 0) {
           this.isDragging = true;
@@ -47,12 +49,17 @@
       });
       document.addEventListener('keydown', (e) => {
         if (e.repeat) return;
+        // inside the photo panel, keys belong to its controls (arrow keys on
+        // sliders); only V/T (exit, save) pass through — N must never reload
+        // into a new world mid-edit
+        if (e.target && e.target.closest && e.target.closest('#photo') &&
+            e.code !== 'KeyV' && e.code !== 'KeyT') return;
         this.keys.add(e.code);
         const map = {
           KeyF: 'auto', KeyH: 'help', KeyP: 'pause', KeyN: 'newseed',
           Digit1: 'q0', Digit2: 'q1', Digit3: 'q2', KeyG: 'glow',
           KeyL: 'light', KeyO: 'autolights', KeyC: 'lightcolor', KeyX: 'removelight',
-          KeyT: 'shot',
+          KeyT: 'shot', KeyV: 'photo',
         };
         if (map[e.code]) this.onToggle(map[e.code]);
       });

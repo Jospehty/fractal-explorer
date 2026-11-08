@@ -34,10 +34,12 @@
     <b>scroll</b> speed &nbsp; <b>Q/E</b> roll<br>
     <b>F</b> auto-dive &nbsp; <b>L</b> drop light &nbsp; <b>C</b> light color &nbsp;
     <b>O</b> auto lights &nbsp; <b>X</b> remove light<br>
-    <b>T</b> screenshot &nbsp; <b>H</b> help &nbsp; <b>1/2/3</b> quality &nbsp;
+    <b>V</b> photo mode &nbsp; <b>T</b> screenshot &nbsp; <b>H</b> help &nbsp; <b>1/2/3</b> quality &nbsp;
     <b>N</b> new world
   </div>
 </div>
+
+<div id="photo" class="hidden"></div>
 
 <div id="help" class="hidden">
   <div class="help-title">How to explore</div>
@@ -57,7 +59,11 @@
   your current scale; <b>C</b> cycles its color; <b>X</b> removes the nearest
   light; <b>O</b> toggles automatic light spawning (turn it off for fully
   manual lighting). Hold still and the renderer accumulates frames into a
-  smooth, supersampled image; <b>T</b> saves the current frame as a PNG.
+  smooth, supersampled image that keeps refining: after a moment it
+  switches to finer detail, so blurry or warped far structure resolves into
+  real geometry. <b>V</b> opens photo mode — the camera freezes and you can
+  change exposure, sun position and color, haze, surface colors and lens
+  live. <b>T</b> saves the current frame as a PNG.
   <b>F</b> lets the autopilot dive for you. <b>N</b> generates a fresh
   universe (shareable via the URL). <b>1/2/3</b> set render quality (shadows
   &amp; light shadows). <b>G</b> toggles light glow. <b>P</b> pauses.</p>

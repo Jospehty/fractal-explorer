@@ -47,6 +47,8 @@
       spread: parseFloat(params.get('spread')) || 0,
       twist: parseFloat(params.get('twist')) || 0,
       foldoff: parseFloat(params.get('foldoff')) || 0,
+      n: parseInt(params.get('n') || '5', 10),
+      h: params.get('h') !== null ? parseFloat(params.get('h')) : 0.5,
     };
   }
   const world = new WM.World(seed);
@@ -103,6 +105,7 @@
     paused: false,
     deCam: world.de(world.camPos),
     lightColIdx: 0,
+    photo: false,
   };
 
   // manual light palette (C cycles, L drops); 'auto' = current level's color
@@ -125,6 +128,7 @@
 
   input.onToggle = (what, val) => {
     if (what === 'lock') {
+      if (state.photo) return; // photo mode keeps the mouse free, no overlay
       overlay.classList.toggle('hidden', val);
       if (!val) overlay.querySelector('.title').textContent = 'Paused — click to fly';
     }
@@ -163,10 +167,124 @@
       });
       flashMsg('screenshot saved');
     }
+    if (what === 'photo') togglePhoto();
     if (what === 'newseed') {
       location.href = location.pathname + '?seed=' + ((Math.random() * 0xffffffff) >>> 0);
     }
   };
+
+  /* ---- photo mode (V) ----
+     Freezes the camera (so the still-frame accumulator refines the image)
+     and releases the mouse for a panel of LIVE look controls: they are
+     shader uniforms (renderer.setLook), so changes apply instantly and the
+     accumulation restarts from the new settings. */
+  const photoBox = document.getElementById('photo');
+  const PHOTO_SPEC = [
+    ['Light'],
+    ['exposure', 'Exposure', 0.3, 3, 0.01],
+    ['sun', 'Sun', 0, 3, 0.01],
+    ['fill', 'Sky fill', 0, 3, 0.01],
+    ['head', 'Headlight', 0, 1, 0.01],
+    ['rim', 'Haze rim', 0, 4, 0.01],
+    ['Sun'],
+    ['customSun', 'Place the sun myself'],
+    ['sunAz', 'Azimuth', 0, 360, 1],
+    ['sunEl', 'Elevation', -15, 89, 1],
+    ['sunHue', 'Sun hue', 0, 1, 0.005],
+    ['sunTint', 'Sun tint', 0, 1, 0.01],
+    ['Color'],
+    ['albHue', 'Surface hue', -0.5, 0.5, 0.005],
+    ['sat', 'Saturation', 0, 2, 0.01],
+    ['hazeHue', 'Haze hue', -0.5, 0.5, 0.005],
+    ['hazeMul', 'Haze density', 0, 3, 0.01],
+    ['glow', 'Vein glow', 0, 4, 0.01],
+    ['Lens'],
+    ['fov', 'Field of view', 30, 120, 1],
+    ['vignette', 'Vignette', 0, 0.7, 0.01],
+  ];
+  const photoInputs = {};
+  function photoValue(key) {
+    return key === 'fov' ? state.fov * 180 / Math.PI : renderer.look[key];
+  }
+  function buildPhoto() {
+    const parts = ['<div class="ph-title">Photo mode</div>',
+      '<div class="ph-note">Camera frozen. Changes apply live and the frame keeps refining. V to fly again.</div>'];
+    for (const row of PHOTO_SPEC) {
+      if (row.length === 1) { parts.push(`<div class="ph-group">${row[0]}</div>`); continue; }
+      const [key, label, min, max, step] = row;
+      if (min === undefined) {
+        parts.push(`<label class="ph-check"><input type="checkbox" id="ph-${key}"> ${label}</label>`);
+      } else {
+        parts.push(`<div class="ph-row"><label for="ph-${key}">${label}</label>` +
+          `<input type="range" id="ph-${key}" min="${min}" max="${max}" step="${step}">` +
+          `<span id="ph-${key}-v"></span></div>`);
+      }
+    }
+    parts.push('<div class="ph-buttons"><button id="ph-reset">Reset look</button>' +
+      '<button id="ph-shot">Save PNG</button><button id="ph-exit">Fly again</button></div>');
+    photoBox.innerHTML = parts.join('');
+    for (const row of PHOTO_SPEC) {
+      if (row.length === 1) continue;
+      const key = row[0];
+      const el = document.getElementById('ph-' + key);
+      photoInputs[key] = el;
+      el.addEventListener('input', () => {
+        if (el.type === 'checkbox') {
+          const patch = { customSun: el.checked };
+          if (el.checked) Object.assign(patch, currentSunAngles());
+          renderer.setLook(patch);
+        } else if (key === 'fov') {
+          state.fov = parseFloat(el.value) * Math.PI / 180;
+          renderer.setLook({}); // restart accumulation
+        } else {
+          const v = parseFloat(el.value);
+          // moving a sun slider implies placing the sun yourself
+          const patch = { [key]: v };
+          if (/^sun(Az|El|Hue|Tint)$/.test(key) && !renderer.look.customSun) {
+            Object.assign(patch, currentSunAngles(), { [key]: v, customSun: true });
+          }
+          renderer.setLook(patch);
+        }
+        syncPhoto();
+      });
+    }
+    document.getElementById('ph-reset').addEventListener('click', () => {
+      renderer.resetLook(); state.fov = 1.15; syncPhoto();
+    });
+    document.getElementById('ph-shot').addEventListener('click', () => input.onToggle('shot'));
+    document.getElementById('ph-exit').addEventListener('click', () => togglePhoto());
+  }
+  // the world's current sun, as world-frame azimuth/elevation (degrees)
+  function currentSunAngles() {
+    const m = world.mood(state.deCam);
+    const w = V.mMulV(V.mTranspose(world.skyBasis), m.sunDir);
+    return {
+      sunAz: ((Math.atan2(w[2], w[0]) * 180 / Math.PI) + 360) % 360,
+      sunEl: Math.asin(Math.max(-1, Math.min(1, w[1]))) * 180 / Math.PI,
+    };
+  }
+  function syncPhoto() {
+    for (const key in photoInputs) {
+      const el = photoInputs[key];
+      const v = photoValue(key);
+      if (el.type === 'checkbox') { el.checked = !!v; continue; }
+      el.value = v;
+      const out = document.getElementById('ph-' + key + '-v');
+      if (out) out.textContent = Math.abs(v) >= 10 ? Math.round(v) : Number(v).toFixed(2);
+    }
+  }
+  function togglePhoto() {
+    state.photo = !state.photo;
+    if (state.photo) {
+      if (!photoBox.firstChild) buildPhoto();
+      syncPhoto();
+      if (document.pointerLockElement) document.exitPointerLock();
+    }
+    input.suspended = state.photo;
+    photoBox.classList.toggle('hidden', !state.photo);
+    overlay.classList.add('hidden');
+    flashMsg(state.photo ? 'photo mode' : 'flying');
+  }
 
   /* ---- movement with collision (DE is a safe lower bound) ---- */
   const MIN_DE = 0.0035;
@@ -285,8 +403,9 @@
     if (DET) dt = 1 / 60;
 
     // look (parity-corrected so reflections never invert the controls)
-    const [yd, pd] = input.consumeLook();
-    const roll = input.rollInput();
+    let [yd, pd] = input.consumeLook();
+    let roll = input.rollInput();
+    if (state.photo) { yd = 0; pd = 0; roll = 0; } // frozen: the frame refines
     if (yd) rotateBasis(cam.up, yd * camParity);
     if (pd) rotateBasis(cam.right, pd * camParity);
     if (roll) rotateBasis(cam.forward, roll * 1.4 * dt * camParity);
@@ -297,7 +416,9 @@
     // move
     state.deCam = world.de(world.camPos);
     let moving = false;
-    if (state.auto) {
+    if (state.photo) {
+      // camera frozen
+    } else if (state.auto) {
       autopilot(dt);
       moving = true;
     } else {

@@ -51,6 +51,16 @@ function foldF32(x, slot) {
     if (fr(x[0] + x[1]) < 0) { const t = fr(-x[0]); x[0] = fr(-x[1]); x[1] = t; }
     if (fr(x[0] + x[2]) < 0) { const t = fr(-x[0]); x[0] = fr(-x[2]); x[2] = t; }
     if (fr(x[1] + x[2]) < 0) { const t = fr(-x[1]); x[1] = fr(-x[2]); x[2] = t; }
+  } else if (S > 3.5) { // DIHEDRAL: abs z, then alternating abs(y) / N2 plane folds
+    x = f3(x[0], x[1], Math.abs(x[2]));
+    const n2 = slot.foldOff;
+    const nOps = WM.dihedralOps(Math.round(slot.foldL));
+    for (let k = 0; k < nOps; k++) {
+      if (k % 2 === 0) { x = f3(x[0], Math.abs(x[1]), x[2]); continue; }
+      const dt = fr(fr(x[0] * n2[0]) + fr(fr(x[1] * n2[1]) + fr(x[2] * n2[2])));
+      const s2 = fr(2 * Math.min(0, dt));
+      x = f3(x[0] - fr(s2 * n2[0]), x[1] - fr(s2 * n2[1]), x[2] - fr(s2 * n2[2]));
+    }
   } else if (S > 2.5) { // ICOSA: 2x (abs + golden plane fold), unconditional form
     for (let round = 0; round < 2; round++) {
       x = f3(Math.abs(x[0]), Math.abs(x[1]), Math.abs(x[2]));
@@ -73,15 +83,16 @@ function foldF32(x, slot) {
 function readSlots(world, ubo) {
   const slots = [];
   for (let i = 0; i < WM.SLOTS; i++) {
-    const o = i * 24;
+    const o = i * WM.LVL_VEC4 * 4;
     slots.push({
       rotCols: [ubo[o], ubo[o + 1], ubo[o + 2], ubo[o + 4], ubo[o + 5], ubo[o + 6], ubo[o + 8], ubo[o + 9], ubo[o + 10]],
       scale: ubo[o + 3], style: ubo[o + 7], foldL: ubo[o + 11],
       trans: [ubo[o + 12], ubo[o + 13], ubo[o + 14]],
       foldOff: [ubo[o + 20], ubo[o + 21], ubo[o + 22]],
+      bound: ubo[o + 24],
     });
   }
-  const base = WM.SLOTS * 24;
+  const base = WM.SLOTS * WM.LVL_VEC4 * 4;
   const outer = [];
   for (let b = 0; b < world.outer.length; b++) {
     const o = base + b * WM.OUTER_VEC4 * 4;
@@ -119,14 +130,22 @@ function foldDeltaF32(d, slot, st) {
     else if (pix) { d[a] = fr(-Sg - db); d[b] = fr(-Sg - da); }
     else if (ref) { d[a] = fr(Sg + da); d[b] = fr(Sg + db); }
   };
-  const goldOp = (Tn) => {
-    const dn = fr(fr(d[0] * ICO_NF[0]) + fr(fr(d[1] * ICO_NF[1]) + fr(d[2] * ICO_NF[2])));
+  const planeOp = (Tn, N) => {
+    const dn = fr(fr(d[0] * N[0]) + fr(fr(d[1] * N[1]) + fr(d[2] * N[2])));
     const ref = Tn < 0, pix = fr(Tn + dn) < 0;
     const f = (ref && pix) ? fr(-2 * dn) : (pix ? fr(-2 * fr(Tn + dn)) : (ref ? fr(2 * Tn) : 0));
-    d = f3(d[0] + fr(f * ICO_NF[0]), d[1] + fr(f * ICO_NF[1]), d[2] + fr(f * ICO_NF[2]));
+    d = f3(d[0] + fr(f * N[0]), d[1] + fr(f * N[1]), d[2] + fr(f * N[2]));
   };
+  const goldOp = (Tn) => planeOp(Tn, ICO_NF);
   const S = slot.style;
-  if (S < 0.5) { flipOp(0, 1, st[0]); flipOp(0, 2, st[1]); flipOp(1, 2, st[2]); }
+  if (S > 3.5) {
+    absOp(2, st[0]);
+    const nOps = WM.dihedralOps(Math.round(slot.foldL));
+    for (let k = 0; k < nOps; k++) {
+      if (k % 2 === 0) absOp(1, st[k + 1]);
+      else planeOp(st[k + 1], slot.foldOff);
+    }
+  } else if (S < 0.5) { flipOp(0, 1, st[0]); flipOp(0, 2, st[1]); flipOp(1, 2, st[2]); }
   else if (S < 2.5) {
     absOp(0, st[0]); absOp(1, st[1]); absOp(2, st[2]);
     swapOp(0, 1, st[3]);
@@ -150,19 +169,20 @@ function mapF32(world, packed, pRel) {
   let b0 = 0;
   while (b0 < B && pp < fr(outer[b0].R * outer[b0].R)) b0++;
   if (B && b0 === B) {
-    let x = fAdd(camF, pf), dr = 1;
+    let x = fAdd(camF, pf), dr = 1, sl = B;
     for (let i = 0; i < WM.N_INNER; i++) {
       x = foldF32(x, slots[B + i]);
       dr = fr(dr * slots[B + i].scale);
+      sl = B + i;
       if (x[0] * x[0] + x[1] * x[1] + x[2] * x[2] > WM.ESCAPE2) break;
     }
-    return fr((fLen(x) - fr(world.bound)) / dr);
+    return fr((fLen(x) - slots[sl].bound) / dr);
   }
   let dr = b0 === 0 ? fr(world.WScale) : outer[b0 - 1].drAfter;
   let d = !B ? pf : (b0 === 0 ? fMat(WCols, pf) : fMat(outer[b0 - 1].qCols, pf));
   // mirrors the OUTER template in shaders.js exactly
   let x = null;
-  let bAbs = -1, esc = false;
+  let bAbs = -1, esc = false, sl = B; // sl: slot of the last applied fold
   for (let b = b0; b < B; b++) {
     const dd = fr(fr(d[0] * d[0]) + fr(d[1] * d[1]) + fr(d[2] * d[2]));
     dr = fr(dr * slots[b].scale);
@@ -172,18 +192,20 @@ function mapF32(world, packed, pRel) {
     } else if (dd > fr(WM.ABS_REL2 * Math.max(fr(fr(outer[b].c[0] * outer[b].c[0]) + fr(fr(outer[b].c[1] * outer[b].c[1]) + fr(outer[b].c[2] * outer[b].c[2]))), 1))) {
       x = foldF32(fAdd(outer[b].c, d), slots[b]);
       bAbs = b;
+      sl = b;
       if (x[0] * x[0] + x[1] * x[1] + x[2] * x[2] > WM.ESCAPE2) esc = true;
       break;
     } else {
       d = foldDeltaF32(d, slots[b], outer[b].st);
       const xe = fAdd(cNext, d);
-      if (xe[0] * xe[0] + xe[1] * xe[1] + xe[2] * xe[2] > WM.ESCAPE2) { x = xe; esc = true; break; }
+      if (xe[0] * xe[0] + xe[1] * xe[1] + xe[2] * xe[2] > WM.ESCAPE2) { x = xe; esc = true; sl = b; break; }
     }
   }
   if (!esc && bAbs >= 0) {
     for (let b = bAbs + 1; b < B; b++) {
       x = foldF32(x, slots[b]);
       dr = fr(dr * slots[b].scale);
+      sl = b;
       if (x[0] * x[0] + x[1] * x[1] + x[2] * x[2] > WM.ESCAPE2) { esc = true; break; }
     }
   } else if (!esc) {
@@ -193,10 +215,11 @@ function mapF32(world, packed, pRel) {
     for (let i = 0; i < WM.N_INNER; i++) {
       x = foldF32(x, slots[B + i]);
       dr = fr(dr * slots[B + i].scale);
+      sl = B + i;
       if (x[0] * x[0] + x[1] * x[1] + x[2] * x[2] > WM.ESCAPE2) break;
     }
   }
-  return fr((fLen(x) - fr(world.bound)) / dr);
+  return fr((fLen(x) - slots[sl].bound) / dr);
 }
 
 /* ---------- deterministic RNG for test points ---------- */
@@ -226,7 +249,7 @@ function checkRebaseInvariance(world, tag) {
   }
   const P = world.params(world.K);
   const camBefore = V.clone(world.camPos);
-  let truncScale = world.bound;
+  let truncScale = world.boundAfter(world.K);
   for (let i = 0; i < WM.N_INNER; i++) truncScale /= world.params(world.K + i).scale;
   // The rendered frame-(K+1) world is the frame-K world seen through the
   // camera-branch AFFINE of Fold_K (the same map descend() applies to lights).
@@ -272,7 +295,7 @@ function checkFastPath(world, tag) {
 }
 
 function checkF32Pipeline(world, tag) {
-  const ubo = new Float32Array((WM.SLOTS * 6 + WM.B_HARD * WM.OUTER_VEC4) * 4);
+  const ubo = new Float32Array((WM.SLOTS * WM.LVL_VEC4 + WM.B_HARD * WM.OUTER_VEC4) * 4);
   world.packUBO(ubo);
   const packed = readSlots(world, ubo);
   let worst = { rel: 0 };

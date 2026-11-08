@@ -40,6 +40,7 @@ Install the **Live Server** extension, right-click `index.html`, and select
 | C | cycle the manual light color (auto / warm / cold / ember / emerald / violet / white) |
 | O | toggle automatic light spawning (off = fully manual lighting) |
 | X | remove the light nearest to you |
+| V | photo mode: freeze the camera, release the mouse, and change exposure, sun position/color, haze, surface colors and lens live |
 | T | save the current frame as a PNG (combine with holding still for supersampled shots) |
 | F | autopilot dive |
 | G | toggle light glow |
@@ -51,7 +52,14 @@ Install the **Live Server** extension, right-click `index.html`, and select
 **Screenshots:** hold perfectly still. The renderer detects a static camera,
 ramps to full resolution and accumulates sub-pixel-jittered frames into a
 supersampled, shimmer-free image (the HUD shows `still ×N` while converging).
-Any input drops instantly back to the responsive path.
+The held image also *refines*: after ~8 frames it switches to half the level-
+of-detail footprint, a bigger step budget and high-quality shadows, and after
+~40 frames halves the footprint again — each switch fades in (the
+accumulator restarts at weight 1/3), so blurry or warped far structure
+resolves into real geometry. Any input drops instantly back to the
+responsive path. **Photo mode (V)** keeps the camera frozen while you adjust
+the look; every control is a live shader uniform, so the image re-converges
+immediately.
 
 ## How it works
 
@@ -65,10 +73,12 @@ version:
   `js/levelgen.js`. Levels are grouped into biomes that share a fold style and
   a curated color *mood* (abyssal teal & bone, ember cathedral, violet nebula,
   jade temple, glacier, copper & verdigris, obsidian & gold, coral, sandstone
-  dusk). Four fold styles: POLY (crystalline), MENGER (architectural), OCTA
-  (canyons) and ICOSA (the icosahedral H3 kaleidoscope — rounded, organic).
-  MENGER/OCTA additionally use offset fold planes (the Mandelbox box-fold
-  trick). Every fold op must be a pure reflection, and every fold must be
+  dusk). Five fold styles: DIHEDRAL (an n-fold radial kaleidoscope, n = 4–7,
+  twisted about its axis level by level — porous coral caverns, overhangs,
+  tunnels and spirals; the most "natural" terrain), POLY (crystalline),
+  MENGER (architectural), OCTA (canyons) and ICOSA (the icosahedral H3
+  kaleidoscope — rounded, organic). MENGER/OCTA additionally use offset fold
+  planes (the Mandelbox box-fold trick). Every fold op must be a pure reflection, and every fold must be
   continuous (curved maps such as sphere folds are ruled out).
 - **Infinite zoom (rebasing).** The camera lives in frame `K`. Approaching the
   surface pushes the camera through the level-`K` fold (float64, exact) and
@@ -83,6 +93,14 @@ version:
   sample ever loses relative precision, however many levels (up to 48) lie
   between it and the camera. That is what allows a horizon of ~10^11 local
   units: structures ~10^10 times your size stay visible.
+- **Per-level bounding radius.** The distance estimate `(|x| - R)/dr` uses
+  the exact bounding radius of the attractor after the last applied level
+  (backward recursion `R_j = (R_{j+1} + |t_j|)/s_j + 2|o_j|`, per absolute
+  level), so a point's distance is identical before and after a rebase even
+  when biomes with very different shapes meet.
+- **Over-relaxed marching** (Keinert et al. 2014): primary rays step 1.25x
+  the safe distance while consecutive spheres overlap, falling back safely
+  when they don't.
 - **Per-level skipping.** A sample within radius `R_b` of the camera takes the
   linear branch at every level `0..b`, so one precomposed matrix replaces all
   of them (inside the smallest radius the whole outer window vanishes). The
@@ -162,8 +180,10 @@ node tools/cpurender.mjs                       # tiny CPU reference render
 Useful URL parameters: `?seed=N` world seed · `?det=1` deterministic test
 mode (exposes `window.__explorer`) · `?sdbg=stats|hitmask|shade|noemis|...`
 shader debug views · `?style=0|1|2|3` force a fold style · `?canon=1`
-canonical Menger · `?look={"fill":0.8,"exposure":1.2}` override the
-lighting/grade constants (`LOOK_DEFAULTS` in `js/shaders.js`).
+canonical Menger · `?style=4&n=5&h=0.6&fscale=3.3&twist=0.4` explore the
+dihedral style (order, ring height, scale, axial twist) ·
+`?look={"fill":0.8,"exposure":1.2}` override the lighting/grade defaults
+(`LOOK_DEFAULTS` in `js/shaders.js`; the same values photo mode edits).
 
 ### Tuning notes (hard-won, do not casually change)
 
@@ -180,5 +200,8 @@ lighting/grade constants (`LOOK_DEFAULTS` in `js/shaders.js`).
   identical: the `OUTER` template in `shaders.js`, `World.de` (float64), the
   float32 emulation in `test/world.test.js`, and `foldDelta` in both
   languages. The tests compare them bit-for-bit-ish at depths up to 10^48.
+- DIHEDRAL connectivity band: solid drums below s≈2.8, porous tori and
+  coral at 2.95–3.45 (`STYLE_ANCHOR`); n ≤ 7 so its fold fits in
+  `MAX_STAGES` (1 + up to 7 mirror ops).
 - Coloring and veins must stay scale-aware: any per-level effect taken as a
   plain min/max over the whole (48-level) window is dominated by root levels.

@@ -50,6 +50,20 @@
   const STYLE_MENGER = 1; // abs + full sort                    -> architectural voids
   const STYLE_OCTA = 2;   // abs + partial sort                 -> canyon lattices
   const STYLE_ICOSA = 3;  // icosahedral kaleidoscope (H3)      -> rounded organic shells
+  const STYLE_DIHEDRAL = 4; // n-fold radial kaleidoscope (D_n x Z2) + axial twist
+                            //                                   -> spirals, petals, coral, arches
+
+  /* DIHEDRAL geometry: order n (3..7), the copy center c = (cos a, sin a, h)
+     on the wedge bisector a = pi/(2n) (copies form 2 rings of 2n), and the
+     second mirror normal N2 = (sin(pi/n), -cos(pi/n), 0). */
+  function dihedral(n, h) {
+    const a = Math.PI / (2 * n);
+    return {
+      foldN: n,
+      dihN: [Math.sin(Math.PI / n), -Math.cos(Math.PI / n), 0],
+      pull: [Math.cos(a), Math.sin(a), h],
+    };
+  }
   const STYLE_TGLAD = 2;  // legacy alias
 
   /* Connectivity anchors: each style's attractor stays connected (solid walls
@@ -65,6 +79,7 @@
     { lo: 2.15, hi: 2.52, pull: [1.0, 0.82, 0.45] }, // OCTA
     { lo: 1.84, hi: 1.99, pull: [1.0, 0.9, 0.65] },  // ICOSA (stylecheck: solid at 1.86,
                                                      // stringy by 2.05 — keep below)
+    { lo: 2.95, hi: 3.45, pull: null },              // DIHEDRAL (pull from dihedral(n, h))
   ];
 
   // Biome: a run of consecutive levels sharing stylistic biases.
@@ -120,10 +135,18 @@
     const styleRoll = r(2);
     // Each biome commits to one style (mixing styles within a biome shreds
     // connectivity); variety across biomes comes from anchors + palettes.
-    const styleBias = styleRoll < 0.3 ? STYLE_MENGER
-      : styleRoll < 0.55 ? STYLE_POLY
-      : styleRoll < 0.8 ? STYLE_ICOSA : STYLE_OCTA;
+    // DIHEDRAL gets the largest share: its porous, spiralling, cavernous
+    // terrain is the most "natural"; the rest keep architectural variety
+    const styleBias = styleRoll < 0.3 ? STYLE_DIHEDRAL
+      : styleRoll < 0.52 ? STYLE_MENGER
+      : styleRoll < 0.68 ? STYLE_POLY
+      : styleRoll < 0.86 ? STYLE_ICOSA : STYLE_OCTA;
     const anchor = STYLE_ANCHOR[styleBias];
+    // DIHEDRAL biome shape: order n, ring height h (validated visually:
+    // solid drums below s~2.8, porous tori/coral 2.95-3.5, spiral detail
+    // from the axial twist)
+    const dih = styleBias === STYLE_DIHEDRAL
+      ? dihedral(4 + Math.floor(r(41) * 4), 0.3 + r(42) * 0.9) : null;
     return {
       hue,
       hueSpread: 0.06 + r(3) * 0.14,
@@ -131,8 +154,13 @@
       styleBias,
       anchor,
       scaleBase: anchor.lo + r(7) * (anchor.hi - anchor.lo),
-      twist: 0.015 + r(6) * 0.065,       // rotation magnitude (radians) — small!
-      twistAxis: V.norm([r(18) * 2 - 1, r(19) * 2 - 1, r(20) * 2 - 1]),
+      // rotation magnitude (radians) — small for the cubic styles (larger
+      // tears them into dust); DIHEDRAL twists about its own axis, where
+      // large angles stay connected and draw spirals across levels
+      twist: dih ? 0.2 + r(6) * 0.3 : 0.015 + r(6) * 0.065,
+      twistAxis: dih ? V.norm([(r(18) - 0.5) * 0.1, (r(19) - 0.5) * 0.1, 1])
+        : V.norm([r(18) * 2 - 1, r(19) * 2 - 1, r(20) * 2 - 1]),
+      dih,
       spread: 0.97 + r(9) * 0.05,        // fold offset spread (kept near canonical)
       emissive: r(10) < mood.emis,       // biome has glowing veins
       // DARK atmosphere: deep, saturated haze. Brightness in the distance
@@ -191,14 +219,17 @@
       const anchor = STYLE_ANCHOR[style];
       const s = o.scale && !o.alt ? o.scale : (anchor.lo + anchor.hi) / 2;
       const k = (s - 1) * (o.spread || 1);
-      const rot = twist ? V.mAxisAngle(V.norm([0.3, 0.9, 0.2]), twist) : V.mIdent();
+      const dh = style === STYLE_DIHEDRAL ? dihedral(o.n || 5, o.h !== undefined ? o.h : 0.5) : null;
+      const pull = dh ? dh.pull : anchor.pull;
+      // DIHEDRAL twists about its symmetry axis (spirals); others about a fixed tilt
+      const rot = twist ? V.mAxisAngle(dh ? [0, 0, 1] : V.norm([0.3, 0.9, 0.2]), twist) : V.mIdent();
       const foDir = V.norm([0.55, 0.8, 0.25]);
-      const foMag = (o.foldoff || 0) * (s - 1);
+      const foMag = dh ? 0 : (o.foldoff || 0) * (s - 1);
       return {
         level: j, zone: 0, biome: biomeParams(seed, 0),
         style, scale: s, rot,
-        trans: [-k * anchor.pull[0] * pullMod[0], -k * anchor.pull[1] * pullMod[1], -k * anchor.pull[2] * pullMod[2]],
-        foldL: 1,
+        trans: [-k * pull[0] * pullMod[0], -k * pull[1] * pullMod[1], -k * pull[2] * pullMod[2]],
+        foldL: 1, foldN: dh ? dh.foldN : 0, dihN: dh ? dh.dihN : null,
         foldOff: [foDir[0] * foMag, foDir[1] * foMag, foDir[2] * foMag],
         pal: hsv(0.55 + 0.06 * (j % 4) + zone5 * 0.3, 0.5, 0.75), emissive: 0,
         light: { spawn: false, col: [1, 1, 1], off: [0, 0, 0], intensity: 0 },
@@ -235,7 +266,7 @@
     const rot = V.mAxisAngle(biome.twistAxis, ang);
 
     const k = (scale - 1) * biome.spread;
-    const pull = biome.anchor.pull;
+    const pull = biome.dih ? biome.dih.pull : biome.anchor.pull;
     const foldL = 1.0;
     const trans = [-k * pull[0], -k * pull[1], -k * pull[2]];
 
@@ -298,13 +329,15 @@
 
     return {
       level: j, zone: zone.index, biome, style, scale, rot, trans, foldL, foldOff,
+      foldN: biome.dih ? biome.dih.foldN : 0, dihN: biome.dih ? biome.dih.dihN : null,
       pal, emissive, accent, glowHue,
       light: { spawn: lightSpawn, col: lightCol, off: lightOff, intensity: lightInt },
     };
   }
 
   const LevelGen = { MOODS, hash32, hashCombine, rnd, srnd, hsv, mixHue, levelParams, zoneOf, biomeParams,
-    STYLE_POLY, STYLE_MENGER, STYLE_OCTA, STYLE_ICOSA, STYLE_TGLAD, STYLE_ANCHOR };
+    STYLE_POLY, STYLE_MENGER, STYLE_OCTA, STYLE_ICOSA, STYLE_DIHEDRAL, STYLE_TGLAD, STYLE_ANCHOR,
+    dihedral };
   global.LevelGen = LevelGen;
   if (typeof module !== 'undefined' && module.exports) module.exports = LevelGen;
 })(typeof window !== 'undefined' ? window : globalThis);

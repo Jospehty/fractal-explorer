@@ -53,13 +53,18 @@
       // without the extension we fall back to RGBA8 and cap the frame count
       this.accumFloat = !!gl.getExtension('EXT_color_buffer_float');
       this.accumN = 0;          // frames accumulated so far (0 = direct path)
+      this.stillFrames = 0;     // frames since the still image stopped resizing
+      // live look / photo-mode settings (uniforms; see LOOK_DEFAULTS)
+      this.look = Object.assign({}, Shaders.LOOK_DEFAULTS, global.__LOOK || {});
+      this.lookVersion = 0;
+      this._lastLookVersion = 0;
       this._targets = null;     // { w, h, scene, a, b }
       this._preStillScale = null;
       this._lastQuality = null;
       this._lastGlow = null;
 
       // uniform block
-      this.uboData = new Float32Array((WM.SLOTS * 6 + WM.B_HARD * WM.OUTER_VEC4) * 4);
+      this.uboData = new Float32Array((WM.SLOTS * WM.LVL_VEC4 + WM.B_HARD * WM.OUTER_VEC4) * 4);
       this.ubo = gl.createBuffer();
       gl.bindBuffer(gl.UNIFORM_BUFFER, this.ubo);
       gl.bufferData(gl.UNIFORM_BUFFER, this.uboData.byteLength, gl.DYNAMIC_DRAW);
@@ -98,14 +103,24 @@
         for (const name of [
           'uRes', 'uTime', 'uCamBasis', 'uFovTan', 'uCamK', 'uW', 'uWScale', 'uB',
           'uSunDir', 'uSunCol', 'uSkyCol', 'uFogCol', 'uLightN', 'uLightPos',
-          'uLightCol', 'uQuality', 'uGlowAmt', 'uBound', 'uProbeOn', 'uProbe',
-          'uJitter', 'uFogMul', 'uHaze', 'uSkyBasis',
+          'uLightCol', 'uQuality', 'uGlowAmt', 'uProbeOn', 'uProbe',
+          'uJitter', 'uFogMul', 'uHaze', 'uSkyBasis', 'uLookA', 'uLookB', 'uLookC', 'uLookD',
         ]) U[name] = gl.getUniformLocation(prog, name);
         this.variants[key] = { prog, U };
       }
       this.prog = this.variants.precise.prog;
       this.U = this.variants.precise.U;
       this.accumN = 0;
+    }
+
+    /* Change look settings (photo mode). Restarts the still accumulation. */
+    setLook(partial) {
+      Object.assign(this.look, partial);
+      this.lookVersion++;
+    }
+    resetLook() {
+      this.look = Object.assign({}, Shaders.LOOK_DEFAULTS, global.__LOOK || {});
+      this.lookVersion++;
     }
 
     /* ---- still-frame accumulation helpers ---- */
@@ -217,12 +232,34 @@
         if (!this.fixedScale && this.resScale < this.maxScale) {
           this.resScale = Math.min(this.maxScale, this.resScale * 1.15);
           this.accumN = 0; // still ramping resolution; sizes change per frame
+          this.stillFrames = 0;
         }
       }
-      if (opts.quality !== this._lastQuality || opts.glow !== this._lastGlow) {
+      if (opts.quality !== this._lastQuality || opts.glow !== this._lastGlow ||
+          this.lookVersion !== this._lastLookVersion) {
         this._lastQuality = opts.quality;
         this._lastGlow = opts.glow;
+        this._lastLookVersion = this.lookVersion;
         this.accumN = 0;
+        this.stillFrames = 0;
+      }
+      /* Progressive refinement while still: after a few frames the held image
+         switches to finer LOD / hit footprint (detail), a bigger step budget
+         and high-quality shadows, twice. Each switch keeps the accumulated
+         image but restarts its weight at 1/3, so new detail fades in instead
+         of popping: blurry/warped far structure resolves into real detail. */
+      let detail = 1, stepMul = 1, quality = opts.quality;
+      if (accumulating) {
+        const stage = this.stillFrames < 8 ? 0 : this.stillFrames < 40 ? 1 : 2;
+        if (stage !== this._stage && stage > 0) this.accumN = Math.min(this.accumN, 2);
+        this._stage = stage;
+        detail = [1, 0.5, 0.25][stage];
+        stepMul = [1, 1.6, 2.4][stage];
+        if (stage > 0) quality = Math.max(quality, 2);
+        this.stillFrames++;
+      } else {
+        this._stage = 0;
+        this.stillFrames = 0;
       }
 
       this.resize();
@@ -248,12 +285,32 @@
       gl.uniform1i(U.uB, (typeof window !== 'undefined' && window.__SHADER_DEBUG === 'noouter') ? 0 : world.outer.length);
       // mood: sky/haze/sun, all continuous in depth; directions world-anchored
       const mood = world.mood(opts.deCam);
-      gl.uniform3fv(U.uSunDir, mood.sunDir);
-      gl.uniform3fv(U.uSunCol, mood.sun);
+      const Lk = this.look;
+      let sunDir = mood.sunDir, sunCol = mood.sun;
+      if (Lk.customSun) {
+        // photo mode: sun placed in WORLD directions (az/el), own color
+        const el = Lk.sunEl * Math.PI / 180, az = Lk.sunAz * Math.PI / 180;
+        sunDir = V.norm(V.mMulV(world.skyBasis,
+          [Math.cos(el) * Math.cos(az), Math.sin(el), Math.cos(el) * Math.sin(az)]));
+        sunCol = global.LevelGen.hsv(Lk.sunHue, Lk.sunTint, 1).map((v) => v * 1.5);
+      }
+      const hueRot = (c, h) => { // rotation about the grey axis, h in turns
+        if (!h) return c;
+        const a = h * 2 * Math.PI, ca = Math.cos(a), sa = Math.sin(a), k = 0.57735027;
+        const kd = k * (c[0] + c[1] + c[2]) * (1 - ca);
+        const cr = [k * (c[2] - c[1]), k * (c[0] - c[2]), k * (c[1] - c[0])]; // k x c
+        return c.map((v, i) => Math.max(0, v * ca + cr[i] * sa + k * kd));
+      };
+      gl.uniform3fv(U.uSunDir, sunDir);
+      gl.uniform3fv(U.uSunCol, sunCol);
       gl.uniformMatrix3fv(U.uSkyBasis, false, V.mToCols(world.skyBasis));
-      gl.uniform3fv(U.uSkyCol, mood.sky);
-      gl.uniform3fv(U.uFogCol, mood.fog);
-      gl.uniform1f(U.uHaze, mood.haze);
+      gl.uniform3fv(U.uSkyCol, hueRot(mood.sky, Lk.hazeHue));
+      gl.uniform3fv(U.uFogCol, hueRot(mood.fog, Lk.hazeHue));
+      gl.uniform1f(U.uHaze, mood.haze * Lk.hazeMul);
+      gl.uniform4f(U.uLookA, Lk.exposure, Lk.sun, Lk.sunSat, Lk.fill);
+      gl.uniform4f(U.uLookB, Lk.ground, Lk.bounce, Lk.head, Lk.rim);
+      gl.uniform4f(U.uLookC, Lk.sat, Lk.huePreserve, Lk.albHue, Lk.glow);
+      gl.uniform4f(U.uLookD, detail, Lk.vignette, stepMul, 0);
 
       const lights = world.gpuLights(opts.deCam);
       for (let i = 0; i < WM.MAX_LIGHTS_GPU; i++) {
@@ -277,9 +334,8 @@
       gl.uniform4fv(U.uLightPos, this.lightPosBuf);
       gl.uniform4fv(U.uLightCol, this.lightColBuf);
       gl.uniform1i(U.uLightN, (typeof window !== 'undefined' && window.__SHADER_DEBUG === 'nolights') ? 0 : lights.length);
-      gl.uniform1i(U.uQuality, opts.quality);
+      gl.uniform1i(U.uQuality, quality);
       gl.uniform1f(U.uGlowAmt, opts.glow);
-      gl.uniform1f(U.uBound, world.bound || 2.5);
       gl.uniform1f(U.uFogMul, world.fogMul || 1);
       gl.uniform1f(U.uProbeOn, opts.probe ? 1 : 0);
       if (opts.probe) gl.uniform3fv(U.uProbe, opts.probe);

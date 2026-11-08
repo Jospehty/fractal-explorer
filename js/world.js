@@ -114,6 +114,18 @@
     ];
   })();
 
+  /* DIHEDRAL style helpers: mirror N1 = y=0 plane; N2 (per level, from the
+     order n) is uploaded to the GPU in the foldOff slot (see packUBO). */
+  const DIH_N1 = [0, 1, 0];
+  function dihedralOps(n) { return n % 2 ? n : n + 1; } // <= 7 (MAX_STAGES - 1)
+  function house(n) { // I - 2 n nᵀ, row-major
+    return [
+      1 - 2 * n[0] * n[0], -2 * n[0] * n[1], -2 * n[0] * n[2],
+      -2 * n[0] * n[1], 1 - 2 * n[1] * n[1], -2 * n[1] * n[2],
+      -2 * n[0] * n[2], -2 * n[1] * n[2], 1 - 2 * n[2] * n[2],
+    ];
+  }
+
   /* ---- the fold: float64 reference implementation ------------------------
      rec=true records {M (linear action, row-major), margin (distance from the
      input point to the nearest branch boundary, in level-input units)}.
@@ -172,6 +184,29 @@
         if (t < 0) {
           x = [x[0] - 2 * t * ICO_N[0], x[1] - 2 * t * ICO_N[1], x[2] - 2 * t * ICO_N[2]];
           if (rec) M = V.mMul(ICO_HOUSE, M);
+        }
+      }
+    } else if (S === LG.STYLE_DIHEDRAL) {
+      // DIHEDRAL: z mirror, then the D_n kaleidoscope around the z axis as an
+      // alternating sequence of conditional reflections across y=0 (N1) and
+      // the plane at angle pi/n (N2). dihedralOps(n) reflections reach the
+      // wedge from any angle (each pair narrows it by 2pi/n). Pure
+      // reflections of a finite group (order 4n) — rebase-safe.
+      if (rec) {
+        st.push(x[2]);
+        margin = Math.min(margin, Math.abs(x[2]));
+        M = V.mMul([1, 0, 0, 0, 1, 0, 0, 0, Math.sign(x[2]) || 1], M);
+      }
+      x = [x[0], x[1], Math.abs(x[2])];
+      const N2 = P.dihN;
+      const nOps = dihedralOps(P.foldN);
+      for (let k = 0; k < nOps; k++) {
+        const N = k % 2 ? N2 : DIH_N1;
+        const t = x[0] * N[0] + x[1] * N[1] + x[2] * N[2];
+        if (rec) { margin = Math.min(margin, Math.abs(t)); st.push(t); }
+        if (t < 0) {
+          x = [x[0] - 2 * t * N[0], x[1] - 2 * t * N[1], x[2] - 2 * t * N[2]];
+          if (rec) M = V.mMul(house(N), M);
         }
       }
     } else {
@@ -245,7 +280,22 @@
       else if (ref) f = 2 * Tn;
       if (f) { d[0] += f * ICO_N[0]; d[1] += f * ICO_N[1]; d[2] += f * ICO_N[2]; }
     };
-    if (S === LG.STYLE_MENGER) {
+    // generic conditional plane reflection "if x·N < 0: x -= 2(x·N)N"
+    const planeOp = (N) => {
+      const Tn = st[k++];
+      const dn = d[0] * N[0] + d[1] * N[1] + d[2] * N[2];
+      const ref = Tn < 0, pix = Tn + dn < 0;
+      let f = 0;
+      if (ref && pix) f = -2 * dn;
+      else if (pix) f = -2 * (Tn + dn);
+      else if (ref) f = 2 * Tn;
+      if (f) { d[0] += f * N[0]; d[1] += f * N[1]; d[2] += f * N[2]; }
+    };
+    if (S === LG.STYLE_DIHEDRAL) {
+      absOp(2);
+      const nOps = dihedralOps(P.foldN);
+      for (let i = 0; i < nOps; i++) planeOp(i % 2 ? P.dihN : DIH_N1);
+    } else if (S === LG.STYLE_MENGER) {
       absOp(0); absOp(1); absOp(2);
       swapOp(0, 1); swapOp(0, 2); swapOp(1, 2);
     } else if (S === LG.STYLE_POLY) {
@@ -260,6 +310,7 @@
   }
   const MAX_STAGES = 8; // ICOSA: 2 x (3 abs + 1 golden)
   const OUTER_VEC4 = 9;  // UBO vec4s per outer level (see packUBO)
+  const LVL_VEC4 = 7;    // UBO vec4s per level slot (see packUBO)
 
   // style ops only (post-rotation, pre-scale part of the fold), for preimages
   function styleOps(v, P) {
@@ -290,9 +341,15 @@
             sg & 4 ? 2 * FO[2] - w[pm[2]] : w[pm[2]],
           ]);
     } else {
-      // POLY / ICOSA: BFS orbit of w under the style's mirror generators
-      // (both groups are finite — order 24 and 120 — so the orbit closes)
-      const R = S === LG.STYLE_ICOSA
+      // POLY / ICOSA / DIHEDRAL: BFS orbit of w under the style's mirror
+      // generators (finite groups — order 24, 120, 4n — so the orbit closes)
+      const refl = (N) => (v) => {
+        const t = v[0] * N[0] + v[1] * N[1] + v[2] * N[2];
+        return [v[0] - 2 * t * N[0], v[1] - 2 * t * N[1], v[2] - 2 * t * N[2]];
+      };
+      const R = S === LG.STYLE_DIHEDRAL
+        ? [(v) => [v[0], v[1], -v[2]], refl(DIH_N1), refl(P.dihN)]
+        : S === LG.STYLE_ICOSA
         ? [
             (v) => [-v[0], v[1], v[2]],
             (v) => [v[0], -v[1], v[2]],
@@ -392,6 +449,7 @@
          same jump the frame distances make, so k*t never jumps. */
       this.fogMul = 1;
       this._pcache = new Map();
+      this._bcache = new Map();
       this.updateChain();
     }
 
@@ -587,21 +645,39 @@
         E.drAfter = cum;
       }
       this.RLin = this.outer.length ? RLin : Infinity;
-      // Attractor bounding radius over the whole active window: the invariant
-      // ball satisfies R >= |t_j|/(s_j - 1) for every level. The DE formula
-      // (|x| - R)/dr is a rigorous lower bound for ANY truncation depth
-      // (cone-break LOD, escape), which is what keeps coarse LOD hole-free.
-      let bound = 2.0;
-      for (let j = Math.max(0, this.K - this.outer.length); j <= this.K + N_INNER; j++) {
-        const P = this.params(j);
-        const t = Math.hypot(P.trans[0], P.trans[1], P.trans[2]);
-        // offset folds displace by up to 2|o| before scaling: |Fold(x)| <=
-        // s*(|x| + 2|o|) + |t|, so the invariant ball grows accordingly
-        const fo = P.foldOff ? Math.hypot(P.foldOff[0], P.foldOff[1], P.foldOff[2]) : 0;
-        bound = Math.max(bound, (t + 2 * P.scale * fo) / (P.scale - 1));
-      }
-      this.bound = bound * 1.05;
+      this.bound = this.boundAfter(this.K - 1); // informational (tools)
       return true;
+    }
+
+    /* Bounding radius of the attractor generated by levels > j, i.e. the
+       radius to subtract when the DE ends right after level j's fold:
+       DE = (|x| - R_{j+1}) / dr. Exact backward recursion of the invariant
+       ball: x in G_i  =>  |x| <= (R_{i+1} + |t_i|)/s_i + 2|o_i|  (offset
+       folds displace by <= 2|o|), started 24 levels ahead from the fixed
+       point of that level (error ~ s^-24). PER ABSOLUTE LEVEL — so the DE
+       of a point is the same before and after a rebase. (A single max over
+       the current window changed whenever the window slid across biomes
+       with different radii: a small pop at zoom steps.) Rigorous for any
+       truncation depth, which is what keeps coarse LOD hole-free. */
+    boundAfter(j) {
+      const key = j + 1;
+      let R = this._bcache.get(key);
+      if (R !== undefined) return R;
+      const term = (P) => {
+        const t = Math.hypot(P.trans[0], P.trans[1], P.trans[2]);
+        const fo = P.foldOff ? Math.hypot(P.foldOff[0], P.foldOff[1], P.foldOff[2]) : 0;
+        return { t, fo };
+      };
+      const J = Math.max(0, key) + 24;
+      const PJ = this.params(J), TJ = term(PJ);
+      R = (TJ.t + 2 * PJ.scale * TJ.fo) / (PJ.scale - 1);
+      for (let i = J - 1; i >= Math.max(0, key); i--) {
+        const P = this.params(i), T = term(P);
+        R = (R + T.t) / P.scale + 2 * T.fo;
+      }
+      R *= 1.05; // float safety margin
+      this._bcache.set(key, R);
+      return R;
     }
 
     /* Float64 distance estimator at frame-K point p (absolute frame-K coords).
@@ -609,6 +685,7 @@
     de(p, forceSlow) {
       let x, dr;
       let escaped = false;
+      let lastJ = this.K - 1; // absolute level of the last fold applied
       if (this.outer.length) {
         const rel = V.sub(p, this.camPos);
         // skip the leading levels this sample is linear through (see R_b)
@@ -643,12 +720,13 @@
             } else if (dd > ABS_REL2 * Math.max(V.dot(E.c, E.c), 1)) {
               x = evalFold(V.add(E.c, d), P).x;
               bAbs = b;
+              lastJ = E.level;
               if (V.dot(x, x) > ESCAPE2) escaped = true;
               break;
             } else {
               d = foldDelta(d, P, E.st);
               const xe = V.add(cn, d);
-              if (V.dot(xe, xe) > ESCAPE2) { x = xe; escaped = true; break; }
+              if (V.dot(xe, xe) > ESCAPE2) { x = xe; escaped = true; lastJ = E.level; break; }
             }
           }
           if (!escaped && bAbs >= 0) {
@@ -657,6 +735,7 @@
             for (let b = bAbs + 1; b < O.length; b++) {
               x = evalFold(x, this.params(O[b].level)).x;
               dr *= O[b].scale;
+              lastJ = O[b].level;
               if (V.dot(x, x) > ESCAPE2) { escaped = true; break; }
             }
           } else if (!escaped) {
@@ -671,10 +750,11 @@
         for (let i = 0; i < N_INNER; i++) {
           x = evalFold(x, this.params(this.K + i)).x;
           dr *= this.params(this.K + i).scale;
+          lastJ = this.K + i;
           if (V.dot(x, x) > ESCAPE2) break;
         }
       }
-      return (V.len(x) - this.bound) / dr;
+      return (V.len(x) - this.boundAfter(lastJ)) / dr;
     }
 
     grad(p, h) {
@@ -891,9 +971,10 @@
 
     /* ---- GPU upload ------------------------------------------------------- */
     /* UBO layout (std140, all vec4):
-         vec4 lvl[SLOTS*6]  — per level slot: rotCol0(w=scale), rotCol1(w=style),
-                              rotCol2(w=foldL), trans(w=emissive), pal(w=accent),
-                              foldOff(w=glow hue) — see packUBO for exact packing
+         vec4 lvl[SLOTS*7]  — per level slot: rotCol0(w=scale), rotCol1(w=style),
+                              rotCol2(w=foldL / dihedral n), trans(w=emissive),
+                              pal(w=accent), foldOff or dihedral N2 (w=glow hue),
+                              (bound after this level, -, -, -)
          vec4 outer[B_HARD*9] — per outer slot: jacCol0 (w=R_b), jacCol1 (w=drAfter_b),
                                 jacCol2, (c.xyz, margin), stages 0-3, stages 4-7
                                 (foldDelta decision scalars), Q_b cols 0-2
@@ -904,18 +985,22 @@
       for (let i = 0; i < SLOTS; i++) {
         const j = this.K - B + i;
         const P = this.params(Math.max(0, j));
-        const o = i * 6 * 4;
+        const o = i * LVL_VEC4 * 4;
         const rc = V.mToCols(P.rot);
         f[o + 0] = rc[0]; f[o + 1] = rc[1]; f[o + 2] = rc[2]; f[o + 3] = P.scale;
         f[o + 4] = rc[3]; f[o + 5] = rc[4]; f[o + 6] = rc[5]; f[o + 7] = P.style;
-        f[o + 8] = rc[6]; f[o + 9] = rc[7]; f[o + 10] = rc[8]; f[o + 11] = P.foldL;
+        f[o + 8] = rc[6]; f[o + 9] = rc[7]; f[o + 10] = rc[8];
+        f[o + 11] = P.style === LG.STYLE_DIHEDRAL ? P.foldN : P.foldL;
         f[o + 12] = P.trans[0]; f[o + 13] = P.trans[1]; f[o + 14] = P.trans[2]; f[o + 15] = P.emissive;
         f[o + 16] = P.pal[0]; f[o + 17] = P.pal[1]; f[o + 18] = P.pal[2]; f[o + 19] = P.accent || 0;
-        const FO = P.foldOff || [0, 0, 0];
+        // slot 5: offset planes (MENGER/OCTA) or the DIHEDRAL mirror normal N2
+        const FO = P.style === LG.STYLE_DIHEDRAL ? P.dihN : (P.foldOff || [0, 0, 0]);
         f[o + 20] = FO[0]; f[o + 21] = FO[1]; f[o + 22] = FO[2];
         f[o + 23] = P.glowHue === undefined ? 0.55 : ((P.glowHue % 1) + 1) % 1;
+        // slot 6: bounding radius after this level's fold (see boundAfter)
+        f[o + 24] = this.boundAfter(Math.max(0, j)); f[o + 25] = 0; f[o + 26] = 0; f[o + 27] = 0;
       }
-      const base = SLOTS * 6 * 4;
+      const base = SLOTS * LVL_VEC4 * 4;
       for (let b = 0; b < B_HARD; b++) {
         const o = base + b * OUTER_VEC4 * 4;
         if (b < B) {
@@ -1036,9 +1121,9 @@
   }
 
   const WorldMod = {
-    World, evalFold, foldDelta, foldPreimage, wedgeNormalize, MAX_STAGES, ABS_REL2, OUTER_VEC4,
+    World, evalFold, foldDelta, foldPreimage, wedgeNormalize, MAX_STAGES, ABS_REL2, OUTER_VEC4, LVL_VEC4,
     B_HARD, B_MIN, HORIZON, N_INNER, SLOTS, DESCEND_DE, ESCAPE2, MAX_LIGHTS_GPU,
-    PHI, ICO_N,
+    PHI, ICO_N, DIH_N1, dihedralOps,
   };
   global.WorldMod = WorldMod;
   if (typeof module !== 'undefined' && module.exports) module.exports = WorldMod;

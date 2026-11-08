@@ -43,7 +43,7 @@ for (const K of depths) {
       await page.evaluate(({ view, look }) => {
         const ex = window.__explorer, V = window.V, w = ex.world, cam = ex.cam;
         window.__LOOK = look;
-        ex.renderer._buildMain();
+        ex.renderer.resetLook(); // look settings are live uniforms
         const g = w.grad(w.camPos);
         const helper = Math.abs(g[1]) < 0.9 ? [0, 1, 0] : [1, 0, 0];
         const t = V.norm(V.cross(g, helper));

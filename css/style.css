@@ -57,3 +57,31 @@ body { font-family: 'Segoe UI', system-ui, sans-serif; color: #dfe7ef; }
   #overlay .keys { display: none; }
   #hud { font-size: 11px; }
 }
+
+/* ---- photo mode panel ---- */
+#photo {
+  position: fixed; right: max(14px, env(safe-area-inset-right, 0px)); top: 14px; bottom: 14px;
+  width: 290px; overflow-y: auto;
+  background: rgba(6,10,18,.84); backdrop-filter: blur(6px);
+  border: 1px solid rgba(140,170,220,.25); border-radius: 10px;
+  padding: 14px 16px; font-size: 12.5px; line-height: 1.4;
+  user-select: none; -webkit-user-select: none;
+}
+#photo .ph-title { font-size: 14px; letter-spacing: 2px; text-transform: uppercase; margin-bottom: 2px; }
+#photo .ph-note { opacity: .6; margin-bottom: 10px; }
+#photo .ph-group { margin-top: 12px; font-size: 10.5px; letter-spacing: 1.5px;
+  text-transform: uppercase; color: #9fd0ff; opacity: .85; }
+#photo .ph-row { display: grid; grid-template-columns: 92px 1fr 40px; align-items: center; gap: 8px; margin-top: 6px; }
+#photo .ph-row span:last-child { text-align: right; font-variant-numeric: tabular-nums; opacity: .7; }
+#photo input[type=range] { width: 100%; accent-color: #9fd0ff; }
+#photo .ph-check { display: flex; align-items: center; gap: 8px; margin-top: 8px; cursor: pointer; }
+#photo .ph-buttons { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+#photo button {
+  flex: 1 1 auto; background: rgba(159,208,255,.12); color: #dfe7ef;
+  border: 1px solid rgba(159,208,255,.4); border-radius: 6px; padding: 6px 10px;
+  font: inherit; cursor: pointer;
+}
+#photo button:hover, #photo button:focus-visible { background: rgba(159,208,255,.25); outline: none; }
+@media (max-width: 700px) {
+  #photo { left: max(14px, env(safe-area-inset-left, 0px)); width: auto; top: auto; max-height: 48vh; }
+}
