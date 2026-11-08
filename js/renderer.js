@@ -34,9 +34,9 @@
         }
         return p;
       };
-      const prog = link(Shaders.FRAG(WM));
-      gl.useProgram(prog);
-      this.prog = prog;
+      this._link = link;
+      this._buildMain();
+      const prog = this.prog;
 
       // still-frame accumulation: blit/average program + ping-pong targets
       this.blitProg = link(Shaders.BLIT_FRAG);
@@ -59,21 +59,11 @@
       this._lastGlow = null;
 
       // uniform block
-      this.uboData = new Float32Array((WM.SLOTS * 6 + WM.B_HARD * 4) * 4);
+      this.uboData = new Float32Array((WM.SLOTS * 6 + WM.B_HARD * WM.OUTER_VEC4) * 4);
       this.ubo = gl.createBuffer();
       gl.bindBuffer(gl.UNIFORM_BUFFER, this.ubo);
       gl.bufferData(gl.UNIFORM_BUFFER, this.uboData.byteLength, gl.DYNAMIC_DRAW);
-      const blockIdx = gl.getUniformBlockIndex(prog, 'Params');
-      gl.uniformBlockBinding(prog, blockIdx, 0);
       gl.bindBufferBase(gl.UNIFORM_BUFFER, 0, this.ubo);
-
-      this.U = {};
-      for (const name of [
-        'uRes', 'uTime', 'uCamBasis', 'uFovTan', 'uCamK', 'uW', 'uWScale', 'uB',
-        'uSunDir', 'uSunCol', 'uSkyCol', 'uFogCol', 'uLightN', 'uLightPos',
-        'uLightCol', 'uQuality', 'uGlowAmt', 'uBound', 'uProbeOn', 'uProbe',
-        'uJitter', 'uFogMul', 'uRLin',
-      ]) this.U[name] = gl.getUniformLocation(prog, name);
 
       this.vao = gl.createVertexArray();
       gl.bindVertexArray(this.vao);
@@ -89,6 +79,33 @@
 
       this.lightPosBuf = new Float32Array(WM.MAX_LIGHTS_GPU * 4);
       this.lightColBuf = new Float32Array(WM.MAX_LIGHTS_GPU * 4);
+    }
+
+    /* (Re)build the main raymarching program — also used by look-dev tools
+       after changing window.__LOOK, without reloading the page. */
+    _buildMain() {
+      const gl = this.gl;
+      // two variants: precise (perturbative outer fold) and fast — see FRAG
+      // in shaders.js. They render identically unless world.needsPerturb.
+      const prev = this.variants || {};
+      this.variants = {};
+      for (const key of ['precise', 'fast']) {
+        if (prev[key]) gl.deleteProgram(prev[key].prog);
+        const prog = this._link(Shaders.FRAG(WM, { perturb: key === 'precise' }));
+        gl.useProgram(prog);
+        gl.uniformBlockBinding(prog, gl.getUniformBlockIndex(prog, 'Params'), 0);
+        const U = {};
+        for (const name of [
+          'uRes', 'uTime', 'uCamBasis', 'uFovTan', 'uCamK', 'uW', 'uWScale', 'uB',
+          'uSunDir', 'uSunCol', 'uSkyCol', 'uFogCol', 'uLightN', 'uLightPos',
+          'uLightCol', 'uQuality', 'uGlowAmt', 'uBound', 'uProbeOn', 'uProbe',
+          'uJitter', 'uFogMul', 'uHaze', 'uSkyBasis',
+        ]) U[name] = gl.getUniformLocation(prog, name);
+        this.variants[key] = { prog, U };
+      }
+      this.prog = this.variants.precise.prog;
+      this.U = this.variants.precise.U;
+      this.accumN = 0;
     }
 
     /* ---- still-frame accumulation helpers ---- */
@@ -176,7 +193,12 @@
 
     render(world, cam, opts) {
       const gl = this.gl;
-      gl.useProgram(this.prog); // the accumulation blit may have switched programs
+      // pick the program variant (and use it: the accumulation blit may have
+      // switched programs)
+      const v = this.variants[world.needsPerturb || opts.probe ? 'precise' : 'fast'];
+      this.prog = v.prog;
+      this.U = v.U;
+      gl.useProgram(this.prog);
 
       /* Still-frame accumulation: while the camera is perfectly still we ramp
          the resolution to 100%, render with sub-pixel Halton jitter into an
@@ -223,14 +245,15 @@
       gl.uniform3f(U.uCamK, world.camPos[0], world.camPos[1], world.camPos[2]);
       gl.uniformMatrix3fv(U.uW, false, V.mToCols(world.W));
       gl.uniform1f(U.uWScale, world.WScale);
-      // 1e18: effectively "always fast path" when there are no outer levels
-      gl.uniform1f(U.uRLin, Number.isFinite(world.RLin) ? world.RLin : 1e18);
       gl.uniform1i(U.uB, (typeof window !== 'undefined' && window.__SHADER_DEBUG === 'noouter') ? 0 : world.outer.length);
-      gl.uniform3fv(U.uSunDir, world.sunDir);
-      gl.uniform3fv(U.uSunCol, opts.sunCol);
+      // mood: sky/haze/sun, all continuous in depth; directions world-anchored
       const mood = world.mood(opts.deCam);
+      gl.uniform3fv(U.uSunDir, mood.sunDir);
+      gl.uniform3fv(U.uSunCol, mood.sun);
+      gl.uniformMatrix3fv(U.uSkyBasis, false, V.mToCols(world.skyBasis));
       gl.uniform3fv(U.uSkyCol, mood.sky);
       gl.uniform3fv(U.uFogCol, mood.fog);
+      gl.uniform1f(U.uHaze, mood.haze);
 
       const lights = world.gpuLights(opts.deCam);
       for (let i = 0; i < WM.MAX_LIGHTS_GPU; i++) {

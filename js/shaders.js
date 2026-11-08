@@ -20,9 +20,84 @@
   #define ESCAPE2 ${WM.ESCAPE2.toFixed(1)}
   #define MAX_LIGHTS ${WM.MAX_LIGHTS_GPU}
   #define ICO_N vec3(${WM.ICO_N.map((v) => v.toFixed(10)).join(', ')})
+  #define OV ${WM.OUTER_VEC4}
+  #define ABS_REL2 ${WM.ABS_REL2.toExponential(4)}
   `;
 
-  const FRAG = (WM) => `#version 300 es
+  /* Look-development constants (lighting balance / grade). Overridable for
+     tuning via the URL: ?look={"fill":0.5,...} (see main.js). */
+  const LOOK_DEFAULTS = {
+    exposure: 1.4,   // pre-tonemap exposure
+    sun: 1.0,        // key light (sun) strength
+    sunSat: 0.6,     // how much of the sun's tint reaches surfaces (1 = full)
+    fill: 1.0,       // hemispheric sky fill strength
+    ground: 0.5,     // fill from below, relative to the haze color
+    bounce: 0.06,    // warm-ish bounce from the side facing away from the sun
+    head: 0.22,      // camera headlight
+    rim: 1.6,        // haze rim on grazing surfaces
+    sat: 1.3,        // albedo saturation
+    huePreserve: 0.5,// 0 = plain ACES (bleaches bright colors), 1 = hue-preserving
+  };
+  const look = () => Object.assign({}, LOOK_DEFAULTS, global.__LOOK || {});
+  const F = (v) => Number(v).toFixed(5);
+
+  /* Outer phase, generated inline into map() and mapDE() (a shared GLSL
+     function with inout state was measured ~2.4x slower: it put the escape
+     test and mode flags on the hot path). Per outer level the delta d (camera
+     relative, frame of that level) takes:
+       linear branch   |d| < margin : d = J d             (the common case)
+       perturbative    otherwise    : d = foldDelta(d)    (exact, relative)
+       absolute        |d| > 4e-3|c| (ABS_REL2) : x = c + d, plain folds for
+                       the rest of the window (tail loop) — absolute rounding
+                       is now small relative to d (see world.js ABS_REL2).
+     trapHook: GLSL run after every level with xs = level-local position. */
+  const OUTER = (trapHook, perturb) => `
+      int bAbs = B_HARD;
+      for (int b = bStart; b < B_HARD; b++) {
+        if (b >= uB) break;
+        vec4 cm = outerData[b*OV+3];
+        float dd = dot(d, d);
+        dr *= lvl[b*6].w;
+        if (dd < cm.w * cm.w) {
+          d = mat3(outerData[b*OV].xyz, outerData[b*OV+1].xyz, outerData[b*OV+2].xyz) * d;
+          ${trapHook ? '{ vec3 xs = ((b + 1 < uB) ? outerData[(b+1)*OV+3].xyz : uCamK) + d; ' + trapHook + ' }' : ''}
+          continue;
+        }
+        vec3 cn = (b + 1 < uB) ? outerData[(b+1)*OV+3].xyz : uCamK;
+        if (dd > ABS_REL2 * max(dot(cm.xyz, cm.xyz), 1.0)) {
+          x = foldLevel(cm.xyz + d, b);
+          bAbs = b;
+          if (dot(x, x) > ESCAPE2) esc = true;
+          ${trapHook ? '{ vec3 xs = x; ' + trapHook + ' }' : ''}
+          break;
+        } else {
+          ${perturb ? 'd = foldDelta(d, b);' : 'd = foldLevel(cm.xyz + d, b) - cn; /* fast variant: unreachable unless world.needsPerturb */'}
+          vec3 xe = cn + d;
+          if (dot(xe, xe) > ESCAPE2) { x = xe; esc = true; break; }
+        }
+        ${trapHook ? '{ vec3 xs = cn + d; ' + trapHook + ' }' : ''}
+      }
+      if (!esc && bAbs < B_HARD) {
+        // absolute tail: remaining outer levels as plain folds
+        for (int b = 0; b < B_HARD; b++) {
+          if (b <= bAbs) continue;
+          if (b >= uB) break;
+          x = foldLevel(x, b);
+          dr *= lvl[b*6].w;
+          if (dot(x, x) > ESCAPE2) { esc = true; break; }
+          ${trapHook ? '{ vec3 xs = x; ' + trapHook + ' }' : ''}
+        }
+      } else if (!esc) {
+        x = uCamK + d;
+      }`;
+
+  /* opts.perturb: compile the perturbative outer fold (foldDelta). It is
+     only ever NEEDED when some outer chain point sits within 4e-3·|c| of a
+     fold crease (world.needsPerturb); otherwise the branch is unreachable
+     and the two variants render identically. Its mere presence costs ~40%
+     march speed (register pressure), so the renderer keeps both programs
+     and picks per frame. */
+  const FRAG = (WM, opts) => { const L = look(); const PERT = !(opts && opts.perturb === false); return `#version 300 es
   precision highp float;
   precision highp int;
   ${DEFS(WM)}
@@ -37,9 +112,6 @@
   uniform mat3  uW;          // composed inverse linear map (frame K -> K-B)
   uniform float uWScale;
   uniform int   uB;          // active outer levels
-  uniform float uRLin;       // near-field radius: within it the outer levels all
-                             // take their linear branch, which composes to the
-                             // IDENTITY, so the outer phase is skipped entirely
   uniform vec3  uSunDir;
   uniform vec3  uSunCol;
   uniform vec3  uSkyCol;
@@ -51,6 +123,10 @@
   uniform float uGlowAmt;
   uniform float uBound;
   uniform vec2  uJitter;     // sub-pixel jitter for still-frame accumulation
+  uniform float uHaze;       // haze extinction per decade of distance (mood)
+  uniform mat3  uSkyBasis;   // WORLD axes in frame-K coords (world.skyBasis):
+                             // "up" and the star field ride it so they never
+                             // jump when a rebase re-charts the frame
   uniform float uFogMul;     // fog continuity multiplier (world.fogMul): scales
                              // fog density up / march limit down as the camera
                              // progresses through a level, so optical depth is
@@ -58,7 +134,7 @@
 
   layout(std140) uniform Params {
     vec4 lvl[SLOTS * 6];        // per slot: rot0(w=scale) rot1(w=style) rot2(w=foldL) trans(w=emissive) pal foldOff
-    vec4 outerData[B_HARD * 4]; // per outer: jac0 jac1 jac2 (c.xyz, margin)
+    vec4 outerData[B_HARD * OV]; // per outer: jac0 jac1 jac2 (c.xyz, margin) stages0-3 stages4-7
   };
 
   /* ---- the fold (mirror of world.js evalFold) ---- */
@@ -90,6 +166,62 @@
     return x * r0.w + tr.xyz;
   }
 
+  /* ---- perturbative fold (mirror of world.js foldDelta) ----
+     Fold(c + d) - Fold(c) for outer slot b from the delta d and the chain
+     point's decision scalars alone: full RELATIVE precision in d at any
+     magnification (deep-zoom perturbation theory). */
+  float stg(int b, int k) { return outerData[b*OV + 4 + (k >> 2)][k & 3]; }
+  void absOp(inout float di, float a) {
+    float v = a + di;
+    if (a >= 0.0) { if (v < 0.0) di = -2.0 * a - di; }
+    else di = v < 0.0 ? -di : 2.0 * a + di;
+  }
+  vec2 swapOp(vec2 dpq, float D) {       // "if x_p < x_q swap", D = ref x_p - x_q
+    bool ref = D < 0.0, pix = D + dpq.x - dpq.y < 0.0;
+    if (ref && pix) return dpq.yx;
+    if (pix) return vec2(-D + dpq.y, D + dpq.x);
+    if (ref) return vec2(D + dpq.x, -D + dpq.y);
+    return dpq;
+  }
+  vec2 flipOp(vec2 dab, float Sg) {      // POLY flip, Sg = ref x_a + x_b
+    bool ref = Sg < 0.0, pix = Sg + dab.x + dab.y < 0.0;
+    if (ref && pix) return -dab.yx;
+    if (pix) return vec2(-Sg - dab.y, -Sg - dab.x);
+    if (ref) return vec2(Sg + dab.x, Sg + dab.y);
+    return dab;
+  }
+  vec3 goldOp(vec3 d, float Tn) {        // golden-plane reflection, Tn = ref x·N
+    float dn = dot(d, ICO_N);
+    bool ref = Tn < 0.0, pix = Tn + dn < 0.0;
+    float f = (ref && pix) ? -2.0 * dn : (pix ? -2.0 * (Tn + dn) : (ref ? 2.0 * Tn : 0.0));
+    return d + f * ICO_N;
+  }
+  vec3 foldDelta(vec3 d, int b) {
+    vec4 r0 = lvl[b*6+0], r1 = lvl[b*6+1], r2 = lvl[b*6+2];
+    d = mat3(r0.xyz, r1.xyz, r2.xyz) * d;
+    float style = r1.w;
+    if (style < 0.5) {            // POLY
+      d.xy = flipOp(d.xy, stg(b, 0));
+      d.xz = flipOp(d.xz, stg(b, 1));
+      d.yz = flipOp(d.yz, stg(b, 2));
+    } else if (style < 2.5) {     // MENGER / OCTA: offset abs + (partial) sort
+      absOp(d.x, stg(b, 0)); absOp(d.y, stg(b, 1)); absOp(d.z, stg(b, 2));
+      d.xy = swapOp(d.xy, stg(b, 3));
+      if (style < 1.5) {
+        d.xz = swapOp(d.xz, stg(b, 4));
+        d.yz = swapOp(d.yz, stg(b, 5));
+      } else {
+        d.yz = swapOp(d.yz, stg(b, 4));
+      }
+    } else {                      // ICOSA
+      absOp(d.x, stg(b, 0)); absOp(d.y, stg(b, 1)); absOp(d.z, stg(b, 2));
+      d = goldOp(d, stg(b, 3));
+      absOp(d.x, stg(b, 4)); absOp(d.y, stg(b, 5)); absOp(d.z, stg(b, 6));
+      d = goldOp(d, stg(b, 7));
+    }
+    return d * r0.w;
+  }
+
   /* ---- two-phase distance estimator ----
      p: camera-relative frame-K position. coneEps: feature size below which we
      band-limit (adaptive iteration count).
@@ -97,42 +229,61 @@
      their owning level slots. Shading crossfades the two slots' palettes by
      trap separation, so colors blend smoothly where trap ownership changes
      instead of snapping (both across surfaces and while zooming).
-     planeTrap: independent plane trap that drives the emissive veins. */
-  float map(vec3 p, float coneEps, out vec4 trapOut, out float planeTrap) {
-    vec3 x;
+     glow: emissive vein light, accumulated per level with a SCALE WINDOW
+     (see veinGlow) so veins are anchored to absolute levels yet only drawn
+     at resolvable, non-overwhelming scales. */
+  /* Scale-aware trap weight: a level may only color a surface if its
+     structures are near the scale it is viewed at. dr*tView ~ (viewing
+     distance / level feature size): levels whose features dwarf the viewing
+     distance (ancient outer levels — you see a tiny piece of them) are
+     smoothly penalized. Without this, the min over a 48-level window was
+     almost always won by a root level, and the whole dive wore one color.
+     Continuous in camera motion, and rebase-invariant (dr*t is). */
+  float trapPenalty(float dr, float tView) {
+    return 0.22 * max(0.0, -log2(max(dr * tView, 1e-30)) - 1.0);
+  }
+
+  /* Emissive veins of level slot s at level-local point xs. Each level's
+     vein (a filament around a plane, core ~0.008 level units = 0.008/dr in
+     frame K) fades IN as its core becomes wider than ~a pixel (sub-pixel
+     veins were pure noise) and OUT before it exceeds a small fraction of the
+     viewing distance (root-level veins used to paint whole colossal surfaces
+     in glow). */
+  vec3 veinGlow(int s, vec3 xs, float dr, float tView, float pixT) {
+    float em = lvl[s*6+3].w;
+    if (em <= 0.0) return vec3(0.0);
+    float w = 0.008 / dr;                        // vein core width, frame-K units
+    float fade = smoothstep(0.8, 2.5, w / pixT)  // resolvable (pixels)
+               * (1.0 - smoothstep(0.0015, 0.008, w / tView)); // filaments, not stripes
+    if (fade <= 0.0) return vec3(0.0);
+    // bright core + soft halo: reads as a glowing filament, not flat paint
+    float dpl = abs(xs.z + 0.4 * xs.x - 0.35);
+    float v = smoothstep(0.006, 0.0, dpl) + 0.35 * exp(-dpl * 90.0);
+    // vivid glow color from the level's glow hue (sat 0.8)
+    float h = lvl[s*6+5].w;
+    vec3 c = clamp(abs(fract(h + vec3(0.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0, 0.0, 1.0);
+    c = mix(vec3(1.0), c, 0.8);
+    return c * (em * v * fade * 0.6);
+  }
+
+  float map(vec3 p, float coneEps, float tView, out vec4 trapOut, out vec3 glow) {
+    vec3 x = vec3(0.0);
     float dr;
     bool esc = false;
     float m1 = 1e9, m2 = 1e9;            // two smallest traps
     float s1 = float(uB), s2 = float(uB); // and their slots
-    float trapP = 1e9; // plane trap: varies across surfaces (emissive veins)
+    vec3 glowAcc = vec3(0.0);
+    float pixT = coneEps / 0.22; // pixel footprint at the hit (t * pix)
     if (uB > 0) {
       vec3 d = uW * p;
       dr = uWScale;
-      for (int b = 0; b < B_HARD; b++) {
-        if (b >= uB) break;
-        vec4 cm = outerData[b*4+3];
-        vec3 cn = (b + 1 < uB) ? outerData[(b+1)*4+3].xyz : uCamK;
-        if (dot(d, d) < cm.w * cm.w) {
-          d = mat3(outerData[b*4].xyz, outerData[b*4+1].xyz, outerData[b*4+2].xyz) * d;
-          dr *= lvl[b*6].w;
-        } else {
-          vec3 xx = foldLevel(cm.xyz + d, b);
-          dr *= lvl[b*6].w;
-          if (dot(xx, xx) > ESCAPE2) { x = xx; esc = true; break; }
-          d = xx - cn;
-        }
-        // Trap sampling through ALL outer levels keeps coloring anchored to
-        // ABSOLUTE levels: any fixed-size sampling window would slide at each
-        // rebase and re-color the surfaces owned by the dropped level.
-        {
-          vec3 xs = cn + d;
-          float ms = length(xs) * 0.9 + 0.12 * abs(xs.y);
+      int bStart = 0; // traps need every level: no skipping here
+      // Trap sampling through ALL outer levels keeps coloring anchored to
+      // ABSOLUTE levels (with the scale-aware penalty — see trapPenalty)
+      ${OUTER(`float ms = length(xs) * 0.9 + 0.12 * abs(xs.y) + trapPenalty(dr, tView);
           if (ms < m1) { m2 = m1; s2 = s1; m1 = ms; s1 = float(b); }
           else if (ms < m2) { m2 = ms; s2 = float(b); }
-          trapP = min(trapP, abs(xs.z + 0.4 * xs.x - 0.35));
-        }
-      }
-      if (!esc) x = uCamK + d;
+          glowAcc += veinGlow(b, xs, dr, tView, pixT);`, PERT)}
     } else {
       x = uCamK + p;
       dr = 1.0;
@@ -143,50 +294,54 @@
         x = foldLevel(x, s);
         dr *= lvl[s*6].w;
         float xx2 = dot(x, x);
-        float m = sqrt(xx2) * 0.9 + 0.12 * abs(x.y); // slight anisotropy for banding
+        float m = sqrt(xx2) * 0.9 + 0.12 * abs(x.y) // slight anisotropy for banding
+                + trapPenalty(dr, tView);
         if (m < m1) { m2 = m1; s2 = s1; m1 = m; s1 = float(s); }
         else if (m < m2) { m2 = m; s2 = float(s); }
-        trapP = min(trapP, abs(x.z + 0.4 * x.x - 0.35));
+        glowAcc += veinGlow(s, x, dr, tView, pixT);
         if (xx2 > ESCAPE2) break;
         ${global.__SHADER_DEBUG === 'nocone' ? '' : 'if (1.0 < dr * coneEps) break;'}
       }
     }
     trapOut = vec4(s1, m1, s2, m2);
-    planeTrap = trapP;
+    glow = glowAcc;
     // (|x| - R)/dr is a rigorous distance lower bound for any truncation depth
     // (R = attractor bounding radius, uploaded per frame) — hole-free LOD.
     return (length(x) - uBound) / dr;
   }
 
   /* Distance-only variant used for ALL marching, normal, AO and shadow
-     samples. Two savings over map(): no orbit-trap bookkeeping, and the
-     near-field fast path — within uRLin of the camera every outer level
-     takes its linear branch, and those branches compose to the IDENTITY
-     (W is the exact inverse product), so the outer phase is skipped. Most
-     samples in a frame are near the camera, so this removes ~uB fold ops
-     per call. Traps are computed by one full map() call at the hit point. */
+     samples. Two savings over map(): no orbit-trap bookkeeping, and per-
+     level SKIPPING — a sample within R_b of the camera takes the linear
+     branch at every level 0..b, so one precomposed matrix Q_b replaces them
+     all; within R_{B-1} (= RLin) every outer level is linear and they
+     compose to the IDENTITY, so the outer phase vanishes. Traps are computed
+     by one full map() call at the hit point. */
   float mapDE(vec3 p, float coneEps) {
-    vec3 x;
+    vec3 x = vec3(0.0);
     float dr;
     bool esc = false;
-    if (uB > 0 && dot(p, p) >= uRLin * uRLin) {
-      vec3 d = uW * p;
-      dr = uWScale;
-      for (int b = 0; b < B_HARD; b++) {
-        if (b >= uB) break;
-        vec4 cm = outerData[b*4+3];
-        if (dot(d, d) < cm.w * cm.w) {
-          d = mat3(outerData[b*4].xyz, outerData[b*4+1].xyz, outerData[b*4+2].xyz) * d;
-          dr *= lvl[b*6].w;
-        } else {
-          vec3 xx = foldLevel(cm.xyz + d, b);
-          dr *= lvl[b*6].w;
-          if (dot(xx, xx) > ESCAPE2) { x = xx; esc = true; break; }
-          d = xx - ((b + 1 < uB) ? outerData[(b+1)*4+3].xyz : uCamK);
-        }
+    // skip the leading outer levels this sample is linear through: R_b is
+    // nonincreasing, so count while |p| < R_b (see world.js, per-level skip)
+    float pp = dot(p, p);
+    int bStart = 0;
+    for (int b = 0; b < B_HARD; b++) {
+      if (b >= uB) break;
+      float R = outerData[b*OV].w;
+      if (pp >= R * R) break;
+      bStart = b + 1;
+    }
+    if (bStart < uB) {
+      vec3 d;
+      if (bStart == 0) { d = uW * p; dr = uWScale; }
+      else {
+        int q = bStart - 1;
+        d = mat3(outerData[q*OV+6].xyz, outerData[q*OV+7].xyz, outerData[q*OV+8].xyz) * p;
+        dr = outerData[q*OV+1].w;
       }
-      if (!esc) x = uCamK + d;
+      ${OUTER('', PERT)}
     } else {
+      // linear through EVERY outer level: they compose to the identity
       x = uCamK + p;
       dr = 1.0;
     }
@@ -234,7 +389,10 @@
       float h = mapD(ro + rd * t, coneEps + t * 2e-3);
       if (h < 1e-6 * t) return 0.0;
       res = min(res, k * h / t);
-      t += clamp(h, t0 * 0.5, tmax * 0.12);
+      if (res < 0.015) return 0.0; // effectively occluded: stop paying
+      // minimum step grows with distance travelled (a cone): penumbrae are
+      // soft far from the surface, so fine steps there were wasted work
+      t += clamp(h, max(t0 * 0.5, t * 0.06), tmax * 0.12);
     }
     return clamp(res, 0.0, 1.0);
   }
@@ -266,25 +424,45 @@
     return fract((p3.x + p3.y) * p3.z);
   }
 
+  /* Haze color seen along direction rd: deep and dark, glowing toward the
+     sun by forward scattering. Far structure dissolves into THIS, so distant
+     colossi read as backlit silhouettes against a luminous sun-side haze and
+     sink into darkness on the far side — instead of a flat pastel wash. */
+  vec3 hazeColor(vec3 rd) {
+    float sd = max(dot(rd, uSunDir), 0.0);
+    float upd = dot(rd, uSkyBasis[1]);
+    return uFogCol * (1.0 + 0.6 * clamp(upd, 0.0, 1.0))
+         + uSunCol * (0.035 * sd * sd + 0.16 * pow(sd, 18.0))
+         + uSkyCol * 0.12;
+  }
+
   vec3 skyColor(vec3 rd) {
     float sd = max(dot(rd, uSunDir), 0.0);
-    vec3 sky = mix(uFogCol * 0.9, uSkyCol, clamp(rd.y * 0.5 + 0.55, 0.0, 1.0));
-    sky += uSunCol * (pow(sd, 320.0) * 3.2 + pow(sd, 16.0) * 0.18);
-    // faint starfield fades in when the biome sky is dark (anchored to world
-    // directions, so it rides sun/frame rotations like everything else)
+    float upd = dot(rd, uSkyBasis[1]);
+    vec3 sky = mix(hazeColor(rd), uSkyCol, clamp(upd * 0.6 + 0.2, 0.0, 1.0) * 0.6);
+    sky += uSunCol * (pow(sd, 900.0) * 6.0 + pow(sd, 90.0) * 0.25);
+    // starfield in WORLD directions (rides the sky basis through rebases)
+    vec3 wd = transpose(uSkyBasis) * rd;
+    vec2 sc = vec2(atan(wd.z, wd.x), asin(clamp(wd.y, -1.0, 1.0))) * 60.0;
+    vec2 cf = fract(sc) - 0.5;
+    float hs = hash12(floor(sc));
+    float star = smoothstep(0.991, 1.0, hs) * smoothstep(0.14, 0.02, dot(cf, cf));
     float lum = dot(uSkyCol, vec3(0.333));
-    if (lum < 0.2) {
-      vec2 sc = vec2(atan(rd.z, rd.x), asin(clamp(rd.y, -1.0, 1.0))) * 42.0;
-      vec2 cf = fract(sc) - 0.5;
-      float star = smoothstep(0.994, 1.0, hash12(floor(sc)))
-                 * smoothstep(0.16, 0.03, dot(cf, cf));
-      sky += vec3(0.75, 0.85, 1.0) * star * (0.2 - lum) * 4.0;
-    }
+    sky += mix(vec3(1.0, 0.8, 0.6), vec3(0.65, 0.8, 1.0), fract(hs * 97.0))
+         * star * clamp(0.25 - lum, 0.0, 0.25) * 6.0;
     return sky;
   }
 
+  // hue rotation about the grey axis (h in turns): material accent colors
+  vec3 hueRot(vec3 c, float h) {
+    float a = h * 6.2831853;
+    const vec3 k = vec3(0.57735027);
+    float ca = cos(a);
+    return c * ca + cross(k, c) * sin(a) + k * dot(k, c) * (1.0 - ca);
+  }
+
   vec3 palette(int slot) { return lvl[slot*6+4].rgb; }
-  float emissiveOf(int slot) { return lvl[slot*6+3].w; }
+  float accentOf(int slot) { return lvl[slot*6+4].w; }
 
   vec3 aces(vec3 x) {
     return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
@@ -297,8 +475,8 @@
     if (uProbeOn > 0.5) {
       // debug: output map(uProbe) bit-exactly, one byte per pixel in R
       // (alpha channel is unusable on an opaque canvas)
-      vec4 tt; float tp;
-      float dv = map(uProbe, 0.0, tt, tp);
+      vec4 tt; vec3 tp;
+      float dv = map(uProbe, 0.0, 1.0, tt, tp);
       uint bb = floatBitsToUint(dv);
       uint sh = uint(gl_FragCoord.x) * 8u;
       fragColor = vec4(float((bb >> sh) & 255u) / 255.0, 0.0, 0.0, 1.0);
@@ -310,13 +488,15 @@
     vec3 rd = normalize(uCamBasis * vec3(uv * uFovTan, 1.0));
     vec3 ro = vec3(0.0);                             // camera at origin of frame K
 
-    const float TMAX = 2.4e5;
+    // Horizon ~1e11 local units: structures up to ~10^10 times your size stay
+    // visible (as hazy colossi). Coupled to world.js HORIZON — see there.
+    const float TMAX = 1.0e11;
     float tmax = TMAX / uFogMul; // effective horizon, continuous across rebases
     int   MAXSTEP = uQuality == 0 ? 100 : (uQuality == 1 ? 150 : 210);
     float t = 0.0;
     float d = 0.0;
     vec4 trap = vec4(0.0);
-    float trapPl = 1e9;
+    vec3 veins = vec3(0.0);
     bool hit = false;
     bool exhausted = false;
     int steps = 0;
@@ -329,7 +509,7 @@
       if (d < t * pix * 0.45 + 2e-6) { hit = true; break; }
       t += min(d, tmax * 0.5) * 0.92;
     }
-    if (hit) map(ro + rd * t, t * pix * 0.22, trap, trapPl); // orbit traps for shading
+    if (hit) map(ro + rd * t, t * pix * 0.22, t, trap, veins); // orbit traps for shading
     ${global.__SHADER_DEBUG === 'stats'
       ? `fragColor = vec4(clamp(log2(t + 1.0) / 15.0, 0.0, 1.0),
                           float(steps) / float(MAXSTEP), hit ? 1.0 : 0.0, 1.0); return;`
@@ -356,10 +536,18 @@
       // boundaries — in space across a surface AND in time while zooming
       float sep = clamp((trap.w - trap.y) / (0.25 * (trap.y + trap.w) + 1e-5), 0.0, 1.0);
       float wA = 0.5 + 0.5 * sep * sep * (3.0 - 2.0 * sep); // smoothstep easing
-      vec3 alb = mix(palette(slotB), palette(slot), wA);
+      vec3 base = mix(palette(slotB), palette(slot), wA);
+      // two-tone material: the level's accent hue takes over where the orbit
+      // trap is large (outer shells / ridges) — same smooth crossfade weights,
+      // so it never snaps either
+      vec3 acc = max(hueRot(base, mix(accentOf(slotB), accentOf(slot), wA)), 0.0);
+      float am = smoothstep(0.45, 1.25, trap.y);
+      vec3 alb = mix(base, acc * 1.1, am * 0.75);
       // trap-based tone variation: crevices darken, ridges lighten
       float tv = clamp(trap.y * 0.7, 0.0, 1.4);
-      alb *= 0.45 + 0.62 * tv;
+      alb *= 0.4 + 0.65 * tv;
+      alb = max(mix(vec3(dot(alb, vec3(0.299, 0.587, 0.114))), alb, ${F(L.sat)}), 0.0);
+      vec3 up = uSkyBasis[1];
 
       // NOTE every absolute length here divides by uFogMul (or multiplies,
       // for extinctions): plain frame-unit constants rescale by s at every
@@ -369,7 +557,12 @@
       float sunDiff = max(dot(n, uSunDir), 0.0);
       float sh = 1.0;
       if (uQuality >= 1 && sunDiff > 0.001) {
-        sh = softShadow(p + n * eps * 3.0, uSunDir, eps * 8.0, 40.0 / uFogMul, 9.0, coneEps, uQuality == 1 ? 40 : 64);
+        // LOCAL reach (~12x your scale, or proportional to the hit distance
+        // for far geometry): the sun sculpts cascading shadows from nearby
+        // structure. Unlimited reach let the colossal parent levels above
+        // you shadow EVERYTHING deep down, leaving interiors flat fill-lit;
+        // the colossi get their depth from the haze instead.
+        sh = softShadow(p + n * eps * 3.0, uSunDir, eps * 8.0, max(12.0 / uFogMul, t * 0.6), 9.0, coneEps, uQuality == 1 ? 28 : 64);
       }
       vec3 hv = normalize(uSunDir - rd);
       float spec = pow(max(dot(n, hv), 0.0), 42.0) * 0.45;
@@ -377,16 +570,26 @@
       ${global.__SHADER_DEBUG === 'shade'
         ? 'fragColor = vec4(dot(alb, vec3(0.33)), sunDiff * sh, ao, 1.0); return;'
         : ''}
-      // deep interiors get little sun: keep ambient LOW so point lights,
-      // emissive veins and the headlight carry the mood — dark corners are a
-      // feature, the sun + shadows sculpt the vistas
-      vec3 amb = (uSkyCol * (0.30 + 0.25 * n.y) * 0.26 + uFogCol * 0.08) * (ao2 * 0.85 + 0.15);
-      col = alb * (amb + uSunCol * sunDiff * sh * 1.15);
-      col += uSunCol * spec * sh * sunDiff;
+      /* Lighting model: one key light (the biome sun, soft shadows), a
+         hemispheric sky fill shaped by AO (dark corners are a feature — the
+         fill is what keeps their FORM readable), a faint bounce opposite the
+         sun, a small camera headlight, and a haze rim. The sun's tint is
+         partly desaturated on surfaces: a strongly tinted sun times a
+         complementary albedo just turns every lit face grey.
+         ("up" is world-anchored via the sky basis — see uSkyBasis) */
+      vec3 sunLit = mix(vec3(dot(uSunCol, vec3(0.333))), uSunCol, ${F(L.sunSat)});
+      vec3 hemi = mix(uFogCol * ${F(L.ground)}, uSkyCol, 0.5 + 0.5 * dot(n, up));
+      vec3 amb = hemi * ${F(L.fill)} * 4.0 * (ao2 * 0.85 + 0.15);
+      amb += sunLit * ${F(L.bounce)} * max(0.0, -dot(n, uSunDir)) * ao;
+      col = alb * (amb + sunLit * sunDiff * sh * ${F(L.sun)});
+      col += sunLit * spec * sh * sunDiff;
       // headlight: soft camera-attached fill so unlit caves stay readable
       float head = max(dot(n, -rd), 0.0);
       float tf = t * uFogMul; // scale-continuous distance for the falloff
-      col += alb * (0.22 * head * head * ao / (1.0 + tf * tf * 0.20));
+      col += alb * (${F(L.head)} * head * head * ao / (1.0 + tf * tf * 0.20));
+      // rim: grazing surfaces pick up the haze behind them, so dark shapes
+      // keep readable silhouettes against the glow instead of merging
+      col += hazeColor(rd) * pow(1.0 - head, 4.0) * ${F(L.rim)} * (0.3 + 0.7 * ao);
 
       vec3 dbgBase = col;
       // point lights: POOLS, not floodlights — the clamp is well below sun
@@ -415,14 +618,11 @@
         col += uLightCol[li].rgb * (diff + lspec) * atten * lsh;
       }
 
-      // emissive veins by level (blended across the same two trap slots as
-      // the albedo so vein color/strength never snaps either)
+      // emissive veins: accumulated per level in map() with a scale window
+      // (veinGlow), so they appear as you approach and never wash or speckle
       ${global.__SHADER_DEBUG === 'noemis' ? '' : `
-      float em = mix(emissiveOf(slotB), emissiveOf(slot), wA);
-      if (em > 0.0) {
-        float vein = smoothstep(0.07, 0.012, trapPl);
-        col += mix(palette(slotB), palette(slot), wA) * em * vein * (0.6 + 0.4 * ao);
-      }`}
+      col += veins * (0.55 + 0.45 * ao);
+      `}
       dbgLights = col - dbgBase;
     } else {
       col = skyColor(rd);
@@ -433,17 +633,22 @@
     // is deliberately clear: most of the horizon work is done by the fade
     // below, so distant structure stays visible across most of the range.
     // All densities scale with uFogMul (continuity across rebases).
-    float fog = 1.0 - exp(-fogT * 1.2e-5 * uFogMul);
-    fog = mix(fog, 1.0 - exp(-fogT * 5.0e-6 * uFogMul), 0.5);
-    // step-exhausted rays get softened toward fog ONLY at range: grazing
-    // silhouettes at distance lose their speckle, while tight caves near the
-    // camera stay DARK instead of being brightened toward the sky color
-    if (exhausted) fog = max(fog, min(0.5, fogT / (tmax * 0.15)));
-    // guarantee FULL fog before tmax, so the farthest vistas fade into the
-    // haze instead of popping out of existence at the far plane
-    fog = max(fog, smoothstep(0.55 * tmax, 0.92 * tmax, fogT));
-    vec3 fogCol = mix(uFogCol, skyColor(rd), 0.35);
-    col = mix(col, fogCol, hit ? fog : fog * 0.25);
+    /* LOG-DISTANCE haze: equal extinction per DECADE of scale-continuous
+       distance u = t*fogMul. Linear fog put a hard ceiling on how big a
+       visible structure could be relative to you (everything past a fixed
+       multiple of your size was simply gone); per-decade haze lets a wall
+       10^6x your size read as a dim colossal silhouette — the sense that the
+       world above you is enormous and continues forever. */
+    float u = fogT * uFogMul;
+    float decades = log(1.0 + u * 0.3) * 0.4342945;
+    float fog = 1.0 - exp(-decades * uHaze);
+    // step-exhausted rays (grazing geometry) are softened only at range:
+    // distant silhouettes lose speckle, near caves stay dark
+    if (exhausted) fog = max(fog, clamp((decades - 1.5) * 0.15, 0.0, 0.5));
+    // guarantee FULL fog before tmax (in log space), so the farthest vistas
+    // dissolve into the haze instead of popping out at the far plane
+    fog = max(fog, smoothstep(log(tmax) - 2.3, log(tmax) - 0.08, log(max(fogT, 1e-6))));
+    col = mix(col, hazeColor(rd), hit ? fog : fog * 0.25);
 
     // light inscatter (glowing orbs + volume glow). NOTE: stored intensity
     // grows ~s^2 per rebase to keep surface lighting scale-invariant, but the
@@ -466,7 +671,12 @@
     col += uSunCol * pow(max(dot(rd, uSunDir), 0.0), 8.0) * 0.03;
 
     ${global.__SHADER_DEBUG === 'terms2' ? 'fragColor = vec4(dot(dbgLights, vec3(0.33)), dot(col, vec3(0.33)) * 0.5, hit ? 0.2 : 0.8, 1.0); return;' : ''}
-    col = aces(col * 1.15);
+    // tonemap: ACES, partly hue-preserving (plain ACES bleaches saturated
+    // brights toward white — the "pale mint" look)
+    col *= ${F(L.exposure)};
+    float lumIn = max(dot(col, vec3(0.2126, 0.7152, 0.0722)), 1e-6);
+    vec3 tmHue = col * (aces(vec3(lumIn)).x / lumIn);
+    col = clamp(mix(aces(col), tmHue, ${F(L.huePreserve)}), 0.0, 1.0);
     col = pow(col, vec3(1.0 / 2.2));
     // vignette + dither
     float vig = 1.0 - 0.22 * dot(uv * 0.62, uv * 0.62);
@@ -474,7 +684,7 @@
     col += (hash12(gl_FragCoord.xy + fract(uTime) * 61.7) - 0.5) / 255.0;
 
     fragColor = vec4(col, 1.0);
-  }`;
+  }`; };
 
   /* Accumulation blit: out = mix(prev, src, blend). Used two ways by the
      renderer: blend = 1/n averages a new jittered frame into the running
@@ -491,7 +701,7 @@
     fragColor = mix(texelFetch(uPrev, px, 0), texelFetch(uSrc, px, 0), uBlend);
   }`;
 
-  const Shaders = { VERT, FRAG, BLIT_FRAG };
+  const Shaders = { VERT, FRAG, BLIT_FRAG, LOOK_DEFAULTS };
   global.Shaders = Shaders;
   if (typeof module !== 'undefined' && module.exports) module.exports = Shaders;
 })(typeof window !== 'undefined' ? window : globalThis);

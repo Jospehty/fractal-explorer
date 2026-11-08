@@ -23,23 +23,34 @@
      c_j    = camera position expressed in frame j
      M_j    = exact linear action (Jacobian) of Fold_j at c_j
      m_j    = distance from c_j to the nearest fold-branch boundary
+     st_j   = c_j's branch DECISION scalars (one per fold op, see foldDelta)
    A ray point p (camera-relative, frame K) starts as d = W·p in frame K-B
    (W = product of inverse linear maps — a pure similarity, so tiny d keeps
    full *relative* float32 precision). Per outer level:
-     |d| < m_j → d ← M_j·d                       (exact linear branch)
-     else      → x = c_j + d; d ← Fold_j(x) − c_{j+1}   (true fold; the point is
-                  far away, so f32 absolute error is sub-pixel at its distance)
+     |d| < m_j           → d ← M_j·d               (exact linear branch)
+     |d| < 4e-3·|c_j|    → d ← foldDelta(d)        (exact PERTURBATIVE fold:
+                            Fold(c+d) - Fold(c) from d and st_j alone — the
+                            deep-zoom Mandelbrot trick; never forms c + d)
+     else                → x = c_j + d, plain folds from here on (d is large,
+                            so f32 rounding of c_j + d is small relative to it)
+   No sample loses relative precision however many levels separate it from
+   the camera, which is what lets the window span 48 levels (~1e11 horizon).
+   Samples within R_b of the camera skip levels 0..b with one precomposed
+   matrix Q_b (see _tryChain); within RLin = R_{B-1} the outer phase vanishes.
    After the outer window, x = c_K + d is a true frame-K coordinate and inner
    levels K..K+N run the plain fold pipeline on O(1) numbers.
 
-   Chain maintenance uses fold PREIMAGES: c_j is a preimage of c_{j+1} under
-   Fold_j, chosen nearest to the previous frame's c_j (mirror choices are
-   symmetry-equivalent, so an occasional forced switch is invisible). If
-   c_{j+1} exits Fold_j's image entirely (camera flew "through a kaleidoscope
-   mirror"), we reflect it back with the wedge normalization T — an exact
-   symmetry of levels ≥ j+1 — lift T through the chain to frame K, and apply it
-   to the camera, lights and sun. T → identity at the mirror itself, so the
-   correction is seamless.
+   Chain maintenance is BRANCH CONTINUATION: c_j = A_j^-1(c_{j+1}) through
+   last frame's affine at level j. If Fold_j(c_j) no longer equals c_{j+1},
+   the camera crossed a fold crease of level j; its true frame-(j+1) position
+   is Fold_j(c_j), so we re-chart with T = A_new·A_old^-1 — by continuity of
+   the fold this is the mirror across the crossed crease, an exact local
+   symmetry of the level-j world — lift T through the chain to frame K, and
+   apply it to the camera, lights and sky. T moves the camera by at most 2x
+   its step, and World.moveCamera sub-steps large moves so creases are
+   crossed one at a time. (Preimage ENUMERATION is only used when no chart
+   exists yet: POLY/OCTA fold images overlap themselves, so "some valid
+   preimage" can lie in a far region — that used to teleport the camera.)
    ============================================================================ */
 (function (global) {
   'use strict';
@@ -53,20 +64,26 @@
      levels for vistas, growing up to B_HARD when the camera lingers near an
      old fold plane. */
   const B_MIN = 8;
-  const B_HARD = 24;
+  const B_HARD = 48;
   /* Coupled to the renderer: the shader marches to tmax = TMAX/fogMul with
-     TMAX = 2.4e5 and fogMul >= 0.85, and guarantees FULL fog by 0.92*tmax
-     (horizon fade in shaders.js) — so the farthest visible geometry is at
-     0.92 * 2.4e5 / 0.85 = 2.6e5 <= 2*HORIZON, and dropping an outer level is
-     never visible. Raising HORIZON further trades test guarantees for range:
-     a larger outer window increases fold-boundary double-crossings when
-     transporting near-camera points across rebases (the outlier budget in
-     test/world.test.js) and grows far-field f32 error (still sub-angular —
-     see the tolerance model there — but re-validate before touching this). */
-  const HORIZON = 1.35e5;
+     TMAX = 1e11 and fogMul >= 0.85, and guarantees FULL fog by ~0.92*tmax
+     (log-space horizon fade in shaders.js) — so the farthest visible geometry
+     is at 0.92 * 1e11 / 0.85 = 1.08e11 <= 2*HORIZON, and dropping an outer
+     level is never visible. A horizon this deep (structures ~10^10x your size
+     stay visible) is only possible because the outer phase is perturbative
+     (foldDelta): no sample ever loses relative precision, however many
+     levels of magnification separate it from the camera. B_HARD = 48 levels
+     covers it for the smallest scale (1.78^48 ~ 1e12). */
+  const HORIZON = 6e10;
   const N_INNER = 16;     // inner detail levels
   const SLOTS = B_HARD + N_INNER;
   const ESCAPE2 = 900.0;  // escape radius^2 for the orbit
+  /* Outer-phase precision switch. Absolute evaluation of c + d in f32 has
+     relative error ~6e-8·|c|/|d| in the delta; once |d| > 4e-3·|c| that is
+     <1.5e-5 (far below a pixel), so the cheaper absolute fold takes over.
+     The perturbative fold (foldDelta) is thus only spent where it matters:
+     samples just past a fold crease close to the camera. Squared ratio: */
+  const ABS_REL2 = 1.6e-5;
   const DESCEND_DE = 0.02;
   const MAX_LIGHTS_STORED = 14;
   const MAX_LIGHTS_GPU = 6;
@@ -106,6 +123,10 @@
     let M = rec ? P.rot.slice() : null;
     let margin = Infinity;
     const S = P.style;
+    // st: the reference DECISION SCALARS of every fold op, in order (see
+    // foldDelta). Their signs are this point's branch choices; with them, any
+    // nearby point's fold can be evaluated in exact delta form.
+    const st = rec ? [] : null;
 
     // Offset fold planes (MENGER/OCTA): the abs fold reflects across x_i=o_i
     // instead of the coordinate planes. Still a pure reflection per op — the
@@ -116,6 +137,7 @@
     const FO = P.foldOff || [0, 0, 0];
     if (S === LG.STYLE_MENGER) {
       if (rec) {
+        st.push(x[0] - FO[0], x[1] - FO[1], x[2] - FO[2]);
         margin = Math.min(margin,
           Math.abs(x[0] - FO[0]), Math.abs(x[1] - FO[1]), Math.abs(x[2] - FO[2]));
         M = V.mMul([Math.sign(x[0] - FO[0]) || 1, 0, 0, 0, Math.sign(x[1] - FO[1]) || 1, 0, 0, 0, Math.sign(x[2] - FO[2]) || 1], M);
@@ -123,26 +145,30 @@
       x = [FO[0] + Math.abs(x[0] - FO[0]), FO[1] + Math.abs(x[1] - FO[1]), FO[2] + Math.abs(x[2] - FO[2])];
       if (rec) margin = Math.min(margin,
         Math.abs(x[0] - x[1]) / SQ2, Math.abs(x[0] - x[2]) / SQ2, Math.abs(x[1] - x[2]) / SQ2);
+      if (rec) st.push(x[0] - x[1]);
       if (x[0] < x[1]) { const t = x[0]; x[0] = x[1]; x[1] = t; if (rec) M = V.mMul([0,1,0, 1,0,0, 0,0,1], M); }
+      if (rec) st.push(x[0] - x[2]);
       if (x[0] < x[2]) { const t = x[0]; x[0] = x[2]; x[2] = t; if (rec) M = V.mMul([0,0,1, 0,1,0, 1,0,0], M); }
+      if (rec) st.push(x[1] - x[2]);
       if (x[1] < x[2]) { const t = x[1]; x[1] = x[2]; x[2] = t; if (rec) M = V.mMul([1,0,0, 0,0,1, 0,1,0], M); }
     } else if (S === LG.STYLE_POLY) {
-      if (rec) margin = Math.min(margin, Math.abs(x[0] + x[1]) / SQ2);
+      if (rec) { margin = Math.min(margin, Math.abs(x[0] + x[1]) / SQ2); st.push(x[0] + x[1]); }
       if (x[0] + x[1] < 0) { const t = -x[0]; x[0] = -x[1]; x[1] = t; if (rec) M = V.mMul([0,-1,0, -1,0,0, 0,0,1], M); }
-      if (rec) margin = Math.min(margin, Math.abs(x[0] + x[2]) / SQ2);
+      if (rec) { margin = Math.min(margin, Math.abs(x[0] + x[2]) / SQ2); st.push(x[0] + x[2]); }
       if (x[0] + x[2] < 0) { const t = -x[0]; x[0] = -x[2]; x[2] = t; if (rec) M = V.mMul([0,0,-1, 0,1,0, -1,0,0], M); }
-      if (rec) margin = Math.min(margin, Math.abs(x[1] + x[2]) / SQ2);
+      if (rec) { margin = Math.min(margin, Math.abs(x[1] + x[2]) / SQ2); st.push(x[1] + x[2]); }
       if (x[1] + x[2] < 0) { const t = -x[1]; x[1] = -x[2]; x[2] = t; if (rec) M = V.mMul([1,0,0, 0,0,-1, 0,-1,0], M); }
     } else if (S === LG.STYLE_ICOSA) {
       // H3 kaleidoscope: two rounds of (abs, golden-plane fold)
       for (let round = 0; round < 2; round++) {
         if (rec) {
+          st.push(x[0], x[1], x[2]);
           margin = Math.min(margin, Math.abs(x[0]), Math.abs(x[1]), Math.abs(x[2]));
           M = V.mMul([Math.sign(x[0]) || 1, 0, 0, 0, Math.sign(x[1]) || 1, 0, 0, 0, Math.sign(x[2]) || 1], M);
         }
         x = [Math.abs(x[0]), Math.abs(x[1]), Math.abs(x[2])];
         const t = x[0] * ICO_N[0] + x[1] * ICO_N[1] + x[2] * ICO_N[2];
-        if (rec) margin = Math.min(margin, Math.abs(t));
+        if (rec) { margin = Math.min(margin, Math.abs(t)); st.push(t); }
         if (t < 0) {
           x = [x[0] - 2 * t * ICO_N[0], x[1] - 2 * t * ICO_N[1], x[2] - 2 * t * ICO_N[2]];
           if (rec) M = V.mMul(ICO_HOUSE, M);
@@ -151,21 +177,89 @@
     } else {
       // OCTA: (offset) abs fold followed by the two diagonal plane folds
       if (rec) {
+        st.push(x[0] - FO[0], x[1] - FO[1], x[2] - FO[2]);
         margin = Math.min(margin,
           Math.abs(x[0] - FO[0]), Math.abs(x[1] - FO[1]), Math.abs(x[2] - FO[2]));
         M = V.mMul([Math.sign(x[0] - FO[0]) || 1, 0, 0, 0, Math.sign(x[1] - FO[1]) || 1, 0, 0, 0, Math.sign(x[2] - FO[2]) || 1], M);
       }
       x = [FO[0] + Math.abs(x[0] - FO[0]), FO[1] + Math.abs(x[1] - FO[1]), FO[2] + Math.abs(x[2] - FO[2])];
-      if (rec) margin = Math.min(margin, Math.abs(x[0] - x[1]) / SQ2);
+      if (rec) { margin = Math.min(margin, Math.abs(x[0] - x[1]) / SQ2); st.push(x[0] - x[1]); }
       if (x[0] < x[1]) { const t = x[0]; x[0] = x[1]; x[1] = t; if (rec) M = V.mMul([0,1,0, 1,0,0, 0,0,1], M); }
-      if (rec) margin = Math.min(margin, Math.abs(x[1] - x[2]) / SQ2);
+      if (rec) { margin = Math.min(margin, Math.abs(x[1] - x[2]) / SQ2); st.push(x[1] - x[2]); }
       if (x[1] < x[2]) { const t = x[1]; x[1] = x[2]; x[2] = t; if (rec) M = V.mMul([1,0,0, 0,0,1, 0,1,0], M); }
     }
 
     x = [x[0] * P.scale + P.trans[0], x[1] * P.scale + P.trans[1], x[2] * P.scale + P.trans[2]];
     if (rec) M = V.mScale(M, P.scale);
-    return rec ? { x, M, margin } : { x };
+    return rec ? { x, M, margin, st } : { x };
   }
+
+  /* ---- perturbative fold ----------------------------------------------------
+     Returns Fold(c + d) - Fold(c) given ONLY the delta d and the reference
+     point's decision scalars st (from evalFold(c, P, true)) — never the
+     absolute c + d. Every quantity is a difference of nearby values, so the
+     result keeps full RELATIVE precision in d no matter how many levels of
+     magnification separate this frame from the camera. This is exactly the
+     perturbation technique of deep-zoom Mandelbrot renderers, applied to the
+     piecewise-reflection folds: each op either takes the reference's branch
+     (delta maps linearly) or the other one (a correction built from the
+     reference's own signed distance to that op's mirror).
+     MUST mirror foldDelta() in shaders.js and the f32 emulation in the tests. */
+  function foldDelta(dIn, P, st) {
+    const d = V.mMulV(P.rot, dIn);
+    const S = P.style;
+    let k = 0;
+    // abs about an (offset) plane: a = reference distance to that plane
+    const absOp = (i) => {
+      const a = st[k++];
+      const v = a + d[i];
+      if (a >= 0) { if (v < 0) d[i] = -2 * a - d[i]; }
+      else d[i] = v < 0 ? -d[i] : 2 * a + d[i];
+    };
+    // "if x_p < x_q swap": D = reference x_p - x_q
+    const swapOp = (p, q) => {
+      const D = st[k++];
+      const ref = D < 0, pix = D + d[p] - d[q] < 0;
+      const dp = d[p], dq = d[q];
+      if (ref && pix) { d[p] = dq; d[q] = dp; }
+      else if (pix) { d[p] = -D + dq; d[q] = D + dp; }
+      else if (ref) { d[p] = D + dp; d[q] = -D + dq; }
+    };
+    // POLY "if x_a + x_b < 0: (x_a, x_b) = (-x_b, -x_a)": Sg = reference x_a + x_b
+    const flipOp = (a, b) => {
+      const Sg = st[k++];
+      const ref = Sg < 0, pix = Sg + d[a] + d[b] < 0;
+      const da = d[a], db = d[b];
+      if (ref && pix) { d[a] = -db; d[b] = -da; }
+      else if (pix) { d[a] = -Sg - db; d[b] = -Sg - da; }
+      else if (ref) { d[a] = Sg + da; d[b] = Sg + db; }
+    };
+    // golden-plane reflection "if x·N < 0: x -= 2(x·N)N": Tn = reference x·N
+    const goldOp = () => {
+      const Tn = st[k++];
+      const dn = d[0] * ICO_N[0] + d[1] * ICO_N[1] + d[2] * ICO_N[2];
+      const ref = Tn < 0, pix = Tn + dn < 0;
+      let f = 0;
+      if (ref && pix) f = -2 * dn;
+      else if (pix) f = -2 * (Tn + dn);
+      else if (ref) f = 2 * Tn;
+      if (f) { d[0] += f * ICO_N[0]; d[1] += f * ICO_N[1]; d[2] += f * ICO_N[2]; }
+    };
+    if (S === LG.STYLE_MENGER) {
+      absOp(0); absOp(1); absOp(2);
+      swapOp(0, 1); swapOp(0, 2); swapOp(1, 2);
+    } else if (S === LG.STYLE_POLY) {
+      flipOp(0, 1); flipOp(0, 2); flipOp(1, 2);
+    } else if (S === LG.STYLE_ICOSA) {
+      for (let round = 0; round < 2; round++) { absOp(0); absOp(1); absOp(2); goldOp(); }
+    } else {
+      absOp(0); absOp(1); absOp(2);
+      swapOp(0, 1); swapOp(1, 2);
+    }
+    return [d[0] * P.scale, d[1] * P.scale, d[2] * P.scale];
+  }
+  const MAX_STAGES = 8; // ICOSA: 2 x (3 abs + 1 golden)
+  const OUTER_VEC4 = 9;  // UBO vec4s per outer level (see packUBO)
 
   // style ops only (post-rotation, pre-scale part of the fold), for preimages
   function styleOps(v, P) {
@@ -268,11 +362,22 @@
       this.K = 0;
       this.camPos = startPos ? startPos.slice() : [0.6, 1.1, 3.4]; // frame-K, float64
       this.hints = [];                      // hints[j] = last-known c_j (preimage selector)
+      this.hintAff = [];                    // hintAff[j] = last affine of Fold_j at c_j (branch continuation)
+      this.chainFailures = 0;               // updateChain wedge loops that did not settle (should stay 0)
+      this.maxCorrection = 0;               // largest wedge-correction displacement BEYOND the 2x-step
+                                            // reflection bound (diagnostic; should stay ~0)
       this.outer = [];                      // per-frame chain, outer[0] = level K-Beff
       this.W = V.mIdent();
       this.WScale = 1;
       this.log10Zoom = 0;
-      this.sunDir = V.norm([0.55, 0.75, 0.35]);
+      /* World-anchored sky frame: columns are the WORLD axes expressed in
+         frame-K coordinates. Every chart change (rebase, wedge correction)
+         re-expresses frame coordinates by a rotation/reflection, so anything
+         that means a fixed direction in the world — "up" for the sky
+         gradient and ambient, the star field, the sun — must ride this basis.
+         (Using the frame's own y axis made the sky and ambient tint jump at
+         rebases.) */
+      this.skyBasis = V.mIdent();
       this.lights = [];                     // {pos (frame K), col, radius, intensity, level}
       this._litLevels = new Set();          // levels that already spawned their light (never respawn)
       this.autoLights = true;               // O key: disable to place lights manually only
@@ -298,10 +403,26 @@
 
     _applyAffine(aff) {
       // apply a frame-K affine symmetry to everything world-anchored
+      // (camera, lights, sky basis — the sun direction derives from it)
       this.camPos = V.add(V.mMulV(aff.M, this.camPos), aff.b);
       for (const L of this.lights) L.pos = V.add(V.mMulV(aff.M, L.pos), aff.b);
-      this.sunDir = V.norm(V.mMulV(aff.M, this.sunDir));
+      this._rotSky(aff.M);
+      // a motion in flight (moveCamera) is re-charted with everything else,
+      // or the camera would bounce back across the crease it just crossed
+      if (this._moveDir) this._moveDir = V.norm(V.mMulV(aff.M, this._moveDir));
       this.pendingRot = V.mMul(this._rotPart(aff.M), this.pendingRot);
+    }
+    _rotSky(M) {
+      this.skyBasis = V.mMul(this._rotPart(M), this.skyBasis);
+      // re-orthonormalize (Gram-Schmidt on columns; handedness preserved) so
+      // thousands of rebases can't drift it
+      const c = V.mToCols(this.skyBasis);
+      let x = V.norm([c[0], c[1], c[2]]);
+      let y = [c[3], c[4], c[5]];
+      y = V.norm(V.sub(y, V.scale(x, V.dot(x, y))));
+      let z = [c[6], c[7], c[8]];
+      z = V.norm(V.sub(V.sub(z, V.scale(x, V.dot(x, z))), V.scale(y, V.dot(y, z))));
+      this.skyBasis = [x[0], y[0], z[0], x[1], y[1], z[1], x[2], y[2], z[2]];
     }
     _rotPart(M) {
       const s = Math.cbrt(Math.abs(
@@ -319,6 +440,7 @@
         if (this._tryChain()) return;
       }
       // Should be unreachable; keep whatever partial chain we have.
+      this.chainFailures++;
       console.warn('updateChain: wedge normalization did not settle');
     }
 
@@ -332,12 +454,47 @@
         const j = this.K - 1 - b;
         const P = this.params(j);
         const hint = this.hints[j] || cNext;
-        const pre = foldPreimage(cNext, P, hint);
-        if (!pre) {
-          // Camera exited Fold_j's image: reflect back (symmetry of levels ≥ j+1),
-          // lifted from frame j+1 to frame K through the already-known affines,
-          // transforming each frame's chain hint on the way up.
-          let T = wedgeNormalize(cNext, P);
+        /* Branch CONTINUATION. The physical camera at level j is ALWAYS the
+           old chart's continuation cand = A_old^-1(c_{j+1}) — that is the
+           point the renderer was showing. If Fold_j(cand) still equals
+           c_{j+1}, nothing happened. Otherwise the camera crossed a fold
+           crease of level j, and its true frame-(j+1) position is
+           Fold_j(cand): re-chart with T = A_new·A_old^-1. Folds are
+           continuous, so A_new = A_old·σ with σ the mirror of the crossed
+           crease, which is an exact local symmetry of the level-j world:
+           T is invisible and moves the camera by at most ~2x its step.
+           (Never search other preimages here: POLY/OCTA fold images overlap
+           themselves, so a "valid" preimage can lie in a far region —
+           jumping the chain there teleported the camera.) */
+        let pre = null;
+        let T = null;
+        const ha = this.hintAff[j];
+        if (ha) {
+          const cand = V.mMulV(ha.Minv, V.sub(cNext, ha.b));
+          const rc = evalFold(cand, P, true);
+          if (Math.abs(rc.x[0] - cNext[0]) + Math.abs(rc.x[1] - cNext[1]) + Math.abs(rc.x[2] - cNext[2]) <
+              1e-10 * Math.max(1, V.len(cNext))) {
+            pre = cand;
+          } else {
+            const bNew = V.sub(rc.x, V.mMulV(rc.M, cand));
+            // T(y) = A_new(A_old^-1(y)) = M y + (bNew - M b_old), M = M_new·M_old^-1
+            const M = V.mMul(rc.M, ha.Minv);
+            T = { M, b: V.sub(bNew, V.mMulV(M, ha.b)) };
+            this.hints[j] = cand;
+            this.hintAff[j] = { Minv: V.mInv(rc.M), b: bNew };
+          }
+        } else {
+          // no chart yet (world construction): nearest preimage to the hint
+          pre = foldPreimage(cNext, P, hint);
+          // Camera outside Fold_j's image: reflect back with the wedge
+          // normalization (only reachable without a chart)
+          if (!pre) T = wedgeNormalize(cNext, P);
+        }
+        if (T) {
+          // lift T from frame j+1 to frame K through the already-known
+          // affines, transforming each frame's chain hint on the way up.
+          // (The per-level affines hintAff[m] are unchanged by a lifted
+          // re-chart: T_{m+1}·A_m·T_m^-1 = A_m by construction.)
           for (let bb = b - 1; bb >= 0; bb--) {
             const m = this.K - 1 - bb; // T is currently expressed in frame m
             if (this.hints[m]) this.hints[m] = V.add(V.mMulV(T.M, this.hints[m]), T.b);
@@ -347,19 +504,32 @@
             const tb = V.add(V.mMulV(A.M, V.add(V.mMulV(T.M, V.mMulV(invAM, V.scale(A.b, -1))), T.b)), A.b);
             T = { M, b: tb };
           }
+          const c0 = this.camPos;
           this._applyAffine(T);
+          // diagnostics: a correction is a reflection across a crease the
+          // camera just crossed, so it moves the camera by at most ~2x the
+          // step. Anything large means the chain lost branch continuity.
+          this.maxCorrection = Math.max(this.maxCorrection,
+            V.dist(c0, this.camPos) - 2.05 * (this._stepNow || 0));
           return false; // restart the walk with the corrected camera
         }
         const r = evalFold(pre, P, true);
         mag *= P.scale;
         full.push({
-          level: j, c: pre, M: r.M, margin: Math.max(0, r.margin * 0.999),
+          level: j, c: pre, M: r.M, st: r.st, margin: Math.max(0, r.margin * 0.999),
           scale: P.scale, crossing: r.margin * mag,
         });
-        affs.push({ M: r.M, b: V.sub(r.x, V.mMulV(r.M, pre)) });
+        const aff = { M: r.M, b: V.sub(r.x, V.mMulV(r.M, pre)) };
+        affs.push(aff);
         this.hints[j] = pre;
+        this.hintAff[j] = { Minv: V.mInv(r.M), b: aff.b };
         cNext = pre;
       }
+      // The level just beyond the walk leaves our view: its chart goes stale
+      // (the camera keeps moving), so drop it. If an ascend brings it back it
+      // is re-derived by enumeration — a stale chart would "continue" into a
+      // wildly wrong re-chart.
+      if (this.K - 1 - BH >= 0) this.hintAff[this.K - 1 - BH] = null;
       // Window size: keep at least B_MIN levels, and keep any older level whose
       // fold boundaries pass within the horizon (dropping it would visibly
       // change near geometry).
@@ -368,6 +538,13 @@
         if (full[b].crossing < HORIZON * 2) { Beff = b + 1; break; }
       }
       this.outer.length = 0;
+      // Does any window level need the perturbative outer fold? (see
+      // ABS_REL2 and the program variants in renderer.js)
+      this.needsPerturb = false;
+      for (let b = 0; b < Beff; b++) {
+        const E = full[b];
+        if (E.margin * E.margin < ABS_REL2 * Math.max(V.dot(E.c, E.c), 1)) this.needsPerturb = true;
+      }
       let W = V.mIdent();
       let WScale = 1;
       for (let b = 0; b < Beff; b++) {
@@ -388,11 +565,26 @@
          samples near the camera — most of them — removing ~B fold/mat ops
          per map() call. (It is also more accurate than the walk: the walk
          carries the rounding noise of W's accumulated matrix inversions.) */
+      /* Per-level SKIP data (the deep-zoom "series approximation" idea):
+         R_b = radius within which levels 0..b ALL take their linear branch
+         (prefix min, nonincreasing in b), Q_b = their composed linear map
+         (frame K -> frame of level b+1), drAfter_b = magnification after
+         level b. A sample at |p| < R_b jumps past levels 0..b with ONE
+         matrix multiply. RLin (all levels linear) is just R_{B-1}; the old
+         all-or-nothing fast path collapsed whenever a single old crease
+         passed near the camera, sending nearly every sample through the
+         whole window. */
       let RLin = Infinity;
       let cum = WScale;
+      let Q = W;
       for (let b = 0; b < this.outer.length; b++) {
-        RLin = Math.min(RLin, this.outer[b].margin / cum);
-        cum *= this.outer[b].scale;
+        const E = this.outer[b];
+        RLin = Math.min(RLin, E.margin / cum);
+        cum *= E.scale;
+        Q = V.mMul(E.M, Q);
+        E.R = RLin;
+        E.Q = Q;
+        E.drAfter = cum;
       }
       this.RLin = this.outer.length ? RLin : Infinity;
       // Attractor bounding radius over the whole active window: the invariant
@@ -413,24 +605,62 @@
     }
 
     /* Float64 distance estimator at frame-K point p (absolute frame-K coords).
-       forceSlow skips the near-field fast path (used by tests to validate it). */
+       forceSlow disables level skipping (used by tests to validate it). */
     de(p, forceSlow) {
       let x, dr;
       let escaped = false;
       if (this.outer.length) {
         const rel = V.sub(p, this.camPos);
-        if (!forceSlow && V.len(rel) < this.RLin) {
+        // skip the leading levels this sample is linear through (see R_b)
+        const rl = V.len(rel);
+        let b0 = 0;
+        if (!forceSlow) while (b0 < this.outer.length && rl < this.outer[b0].R) b0++;
+        if (b0 === this.outer.length) {
           // all outer levels act linearly here and compose to the identity
           x = p.slice();
           dr = 1;
         } else {
-          const d = V.mMulV(this.W, rel);
-          x = V.add(this.outer[0].c, d);
-          dr = this.WScale;
-          for (let b = 0; b < this.outer.length; b++) {
-            x = evalFold(x, this.params(this.outer[b].level)).x;
-            dr *= this.outer[b].scale;
-            if (V.dot(x, x) > ESCAPE2) { escaped = true; break; }
+          // Outer phase in PERTURBATIVE form: d = (point - c_j) in frame j,
+          // carried exactly through every outer fold (see foldDelta). Only
+          // once d is large (the point is far from the camera at this level's
+          // scale) do absolute coordinates take over — then their rounding is
+          // small relative to d. (Absolute evaluation of c + d at the
+          // outermost level loses s^B of precision: unusable for big windows.)
+          // (structure mirrors the OUTER template in shaders.js exactly)
+          const O = this.outer;
+          let d = b0 === 0 ? V.mMulV(this.W, rel) : V.mMulV(O[b0 - 1].Q, rel);
+          dr = b0 === 0 ? this.WScale : O[b0 - 1].drAfter;
+          let bAbs = -1;
+          x = null;
+          for (let b = b0; b < O.length; b++) {
+            const E = O[b];
+            const P = this.params(E.level);
+            const dd = V.dot(d, d);
+            dr *= E.scale;
+            const cn = b + 1 < O.length ? O[b + 1].c : this.camPos;
+            if (dd < E.margin * E.margin) {
+              d = V.mMulV(E.M, d);
+            } else if (dd > ABS_REL2 * Math.max(V.dot(E.c, E.c), 1)) {
+              x = evalFold(V.add(E.c, d), P).x;
+              bAbs = b;
+              if (V.dot(x, x) > ESCAPE2) escaped = true;
+              break;
+            } else {
+              d = foldDelta(d, P, E.st);
+              const xe = V.add(cn, d);
+              if (V.dot(xe, xe) > ESCAPE2) { x = xe; escaped = true; break; }
+            }
+          }
+          if (!escaped && bAbs >= 0) {
+            // absolute tail: d is large here, so absolute rounding is small
+            // relative to it
+            for (let b = bAbs + 1; b < O.length; b++) {
+              x = evalFold(x, this.params(O[b].level)).x;
+              dr *= O[b].scale;
+              if (V.dot(x, x) > ESCAPE2) { escaped = true; break; }
+            }
+          } else if (!escaped) {
+            x = V.add(this.camPos, d);
           }
         }
       } else {
@@ -456,20 +686,60 @@
       ]);
     }
 
+    /* Move the camera by a frame-K displacement, CONTINUOUSLY. The outer
+       chain tracks the camera's branch at every level; a single large jump
+       can cross several fold creases at once, and the preimage choice after
+       such a jump is ambiguous (the wrong choice puts the camera "outside"
+       an outer fold image and the wedge correction then teleports it). Sub-
+       stepping keeps every step inside RLin — the radius in which NO outer
+       crease exists — so creases are crossed one at a time and each wedge
+       correction is a tiny exact reflection. Bounded: at most ~48 substeps
+       (the floor of |delta|/32 stops Zeno-shrinking toward a crease). */
+    moveCamera(delta) {
+      let rem = V.len(delta);
+      if (!(rem > 0)) return null;
+      this._moveDir = V.scale(delta, 1 / rem);
+      const floor = rem / 32;
+      for (let i = 0; i < 48 && rem > 0; i++) {
+        const lim = Number.isFinite(this.RLin) ? Math.max(0.5 * this.RLin, floor) : rem;
+        const step = Math.min(rem, lim);
+        this.camPos = V.add(this.camPos, V.scale(this._moveDir, step));
+        rem -= step;
+        this._stepNow = step;
+        if (rem > 0) this.updateChain();
+      }
+      if (rem > 0) this.camPos = V.add(this.camPos, V.scale(this._moveDir, rem));
+      this._stepNow = Math.max(this._stepNow, rem);
+      const dirOut = this._moveDir;
+      this._moveDir = null;
+      this.updateChain();
+      this._stepNow = 0;
+      return dirOut; // the motion direction in the (possibly re-charted) frame
+    }
+
     /* ---- rebasing -------------------------------------------------------- */
     descend() {
       const P = this.params(this.K);
       const r = evalFold(this.camPos, P, true);
       this.hints[this.K] = this.camPos;
+      // the exact branch affine just used — a stale one from an earlier visit
+      // to this level would "continue" into a wrong (mirror-copy) preimage
       const s = P.scale, s2 = s * s;
+      // World-anchored points must be carried by the camera-branch AFFINE
+      // (r.M, b), never by the true fold: the rendered frame-(K+1) world is
+      // exactly the frame-K world seen through that affine. evalFold() would
+      // reflect anything lying across a level-K mirror (relative to the
+      // camera) to its mirror image — lights visibly teleported at rebases.
+      const bAff = V.sub(r.x, V.mMulV(r.M, this.camPos));
+      this.hintAff[this.K] = { Minv: V.mInv(r.M), b: bAff };
       // x s^2 keeps the rebase photometrically EXACT (no blink); the age fade
       // is applied continuously at upload time in gpuLights().
       for (const L of this.lights) {
-        L.pos = evalFold(L.pos, P).x;
+        L.pos = V.add(V.mMulV(r.M, L.pos), bAff);
         L.radius *= s;
         L.intensity *= s2;
       }
-      this.sunDir = V.norm(V.mMulV(r.M, this.sunDir));
+      this._rotSky(r.M);
       this.pendingRot = V.mMul(this._rotPart(r.M), this.pendingRot);
       this.camPos = r.x;
       this.K++;
@@ -483,7 +753,18 @@
     ascend() {
       if (this.K <= 0) return false;
       const P = this.params(this.K - 1);
-      let pre = foldPreimage(this.camPos, P, this.hints[this.K - 1] || this.camPos);
+      // The physical camera at level K-1 is the chain's continuation through
+      // the current branch affine (exact, unambiguous). Enumerating preimages
+      // instead could pick another mirror copy for POLY/OCTA, whose fold
+      // images overlap — a teleport on zoom-out.
+      let pre = null;
+      const ha = this.hintAff[this.K - 1];
+      if (ha) {
+        const cand = V.mMulV(ha.Minv, V.sub(this.camPos, ha.b));
+        const chk = evalFold(cand, P).x;
+        if (V.dist(chk, this.camPos) < 1e-10 * Math.max(1, V.len(this.camPos))) pre = cand;
+      }
+      if (!pre) pre = foldPreimage(this.camPos, P, this.hints[this.K - 1] || this.camPos);
       if (!pre) {
         this._applyAffine(wedgeNormalize(this.camPos, P));
         pre = foldPreimage(this.camPos, P, this.hints[this.K - 1] || this.camPos);
@@ -491,6 +772,7 @@
       }
       const r = evalFold(pre, P, true); // exact affine at the preimage
       const invM = V.mInv(r.M);
+      this.hintAff[this.K - 1] = null; // level K-1 becomes inner; re-derive on next descend
       const s = P.scale, s2 = s * s;
       const bb = V.sub(r.x, V.mMulV(r.M, pre));
       for (const L of this.lights) {
@@ -498,7 +780,7 @@
         L.radius /= s;
         L.intensity /= s2;
       }
-      this.sunDir = V.norm(V.mMulV(invM, this.sunDir));
+      this._rotSky(invM);
       this.pendingRot = V.mMul(this._rotPart(invM), this.pendingRot);
       this.camPos = pre;
       this.K--;
@@ -610,9 +892,11 @@
     /* ---- GPU upload ------------------------------------------------------- */
     /* UBO layout (std140, all vec4):
          vec4 lvl[SLOTS*6]  — per level slot: rotCol0(w=scale), rotCol1(w=style),
-                              rotCol2(w=foldL), trans(w=emissive), pal,
-                              foldOff — see packUBO for exact packing
-         vec4 outer[B_HARD*4] — per outer slot: jacCol0, jacCol1, jacCol2, (c.xyz, margin)
+                              rotCol2(w=foldL), trans(w=emissive), pal(w=accent),
+                              foldOff(w=glow hue) — see packUBO for exact packing
+         vec4 outer[B_HARD*9] — per outer slot: jacCol0 (w=R_b), jacCol1 (w=drAfter_b),
+                                jacCol2, (c.xyz, margin), stages 0-3, stages 4-7
+                                (foldDelta decision scalars), Q_b cols 0-2
        Slot i covers absolute level (K - Beff + i).                            */
     packUBO(buf) {
       const B = this.outer.length;
@@ -626,22 +910,29 @@
         f[o + 4] = rc[3]; f[o + 5] = rc[4]; f[o + 6] = rc[5]; f[o + 7] = P.style;
         f[o + 8] = rc[6]; f[o + 9] = rc[7]; f[o + 10] = rc[8]; f[o + 11] = P.foldL;
         f[o + 12] = P.trans[0]; f[o + 13] = P.trans[1]; f[o + 14] = P.trans[2]; f[o + 15] = P.emissive;
-        f[o + 16] = P.pal[0]; f[o + 17] = P.pal[1]; f[o + 18] = P.pal[2]; f[o + 19] = 0;
+        f[o + 16] = P.pal[0]; f[o + 17] = P.pal[1]; f[o + 18] = P.pal[2]; f[o + 19] = P.accent || 0;
         const FO = P.foldOff || [0, 0, 0];
-        f[o + 20] = FO[0]; f[o + 21] = FO[1]; f[o + 22] = FO[2]; f[o + 23] = 0;
+        f[o + 20] = FO[0]; f[o + 21] = FO[1]; f[o + 22] = FO[2];
+        f[o + 23] = P.glowHue === undefined ? 0.55 : ((P.glowHue % 1) + 1) % 1;
       }
       const base = SLOTS * 6 * 4;
       for (let b = 0; b < B_HARD; b++) {
-        const o = base + b * 4 * 4;
+        const o = base + b * OUTER_VEC4 * 4;
         if (b < B) {
           const E = this.outer[b];
           const jc = V.mToCols(E.M);
-          f[o + 0] = jc[0]; f[o + 1] = jc[1]; f[o + 2] = jc[2]; f[o + 3] = 0;
-          f[o + 4] = jc[3]; f[o + 5] = jc[4]; f[o + 6] = jc[5]; f[o + 7] = 0;
+          f[o + 0] = jc[0]; f[o + 1] = jc[1]; f[o + 2] = jc[2]; f[o + 3] = Math.min(E.R, 1e30);
+          f[o + 4] = jc[3]; f[o + 5] = jc[4]; f[o + 6] = jc[5]; f[o + 7] = E.drAfter;
           f[o + 8] = jc[6]; f[o + 9] = jc[7]; f[o + 10] = jc[8]; f[o + 11] = 0;
           f[o + 12] = E.c[0]; f[o + 13] = E.c[1]; f[o + 14] = E.c[2]; f[o + 15] = E.margin;
+          for (let k = 0; k < MAX_STAGES; k++) f[o + 16 + k] = k < E.st.length ? E.st[k] : 0;
+          const qc = V.mToCols(E.Q);
+          for (let k = 0; k < 3; k++) {
+            f[o + 24 + k * 4] = qc[k * 3]; f[o + 25 + k * 4] = qc[k * 3 + 1];
+            f[o + 26 + k * 4] = qc[k * 3 + 2]; f[o + 27 + k * 4] = 0;
+          }
         } else {
-          for (let k = 0; k < 16; k++) f[o + k] = 0;
+          for (let k = 0; k < OUTER_VEC4 * 4; k++) f[o + k] = 0;
         }
       }
       return f;
@@ -683,7 +974,9 @@
       const fr = Math.min(1, Math.max(0, D - j0));
       const a = this.params(j0).biome;
       const b = this.params(j0 + 1).biome;
-      return { sky: V.lerp(a.sky, b.sky, fr), fog: V.lerp(a.fog, b.fog, fr) };
+      return { sky: V.lerp(a.sky, b.sky, fr), fog: V.lerp(a.fog, b.fog, fr),
+        haze: a.haze + (b.haze - a.haze) * fr,
+        sun: V.lerp(a.sun, b.sun, fr), sunW: V.lerp(a.sunW, b.sunW, fr) };
     }
     mood(deCam) {
       // Average three samples along the depth track: biome (zone) changes
@@ -695,7 +988,10 @@
         (a[k][1] + b[k][1] + c[k][1]) / 3,
         (a[k][2] + b[k][2] + c[k][2]) / 3,
       ];
-      return { sky: avg('sky'), fog: avg('fog') };
+      // the sun's direction is WORLD-anchored (biome trait), mapped into the
+      // current frame through the sky basis
+      return { sky: avg('sky'), fog: avg('fog'), haze: (a.haze + b.haze + c.haze) / 3,
+        sun: avg('sun'), sunDir: V.norm(V.mMulV(this.skyBasis, V.norm(avg('sunW')))) };
     }
 
     /* Continuous depth in log10 units (K progress inferred from camera DE),
@@ -740,7 +1036,7 @@
   }
 
   const WorldMod = {
-    World, evalFold, foldPreimage, wedgeNormalize,
+    World, evalFold, foldDelta, foldPreimage, wedgeNormalize, MAX_STAGES, ABS_REL2, OUTER_VEC4,
     B_HARD, B_MIN, HORIZON, N_INNER, SLOTS, DESCEND_DE, ESCAPE2, MAX_LIGHTS_GPU,
     PHI, ICO_N,
   };

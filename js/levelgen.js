@@ -91,10 +91,32 @@
     return { index: lo, start: c[lo], end: c[hi] };
   }
 
+  /* Curated color MOODS. Each is a harmonized scheme — surface, haze, sky,
+     accent, sun, light color — instead of independent random hues: the old
+     scheme made atmosphere and lights COMPLEMENTARY to the surfaces, and
+     complementary colors mixed through fill light cancel to grey-brown mud.
+     Hues in turns (0 red, .08 orange, .15 yellow, .33 green, .5 cyan,
+     .6 blue, .75 violet, .85 magenta). Per biome a mood is jittered slightly,
+     and zone edges blend continuously (levelParams), so every dive drifts
+     through a sequence of distinct, coherent atmospheres. */
+  const MOODS = [
+    // surf [h,s,v]        haze [h,s,v]         sky [h,s,v]        accent  sun [h,s,k]       light  emis
+    { surf: [0.10, 0.18, 0.62], haze: [0.50, 0.75, 0.035], sky: [0.52, 0.60, 0.09], acc: 0.40, sun: [0.10, 0.45, 1.5], light: 0.50, emis: 0.5 },  // abyssal teal & bone
+    { surf: [0.07, 0.45, 0.55], haze: [0.99, 0.75, 0.030], sky: [0.02, 0.70, 0.07], acc: -0.07, sun: [0.06, 0.65, 1.7], light: 0.05, emis: 0.6 }, // ember cathedral
+    { surf: [0.74, 0.25, 0.60], haze: [0.70, 0.70, 0.035], sky: [0.72, 0.60, 0.10], acc: 0.13, sun: [0.52, 0.35, 1.4], light: 0.85, emis: 0.45 }, // violet nebula
+    { surf: [0.40, 0.45, 0.50], haze: [0.42, 0.65, 0.030], sky: [0.45, 0.50, 0.08], acc: -0.28, sun: [0.12, 0.25, 1.5], light: 0.12, emis: 0.35 }, // jade temple, gold
+    { surf: [0.56, 0.18, 0.72], haze: [0.62, 0.70, 0.040], sky: [0.60, 0.55, 0.12], acc: -0.06, sun: [0.60, 0.30, 1.3], light: 0.55, emis: 0.3 },  // glacier, moonlight
+    { surf: [0.06, 0.55, 0.50], haze: [0.55, 0.35, 0.030], sky: [0.55, 0.30, 0.08], acc: 0.40, sun: [0.10, 0.30, 1.5], light: 0.45, emis: 0.35 },  // copper & verdigris
+    { surf: [0.08, 0.15, 0.24], haze: [0.08, 0.40, 0.015], sky: [0.08, 0.35, 0.04], acc: 0.04, sun: [0.10, 0.50, 1.3], light: 0.10, emis: 0.9 },   // obsidian & gold
+    { surf: [0.98, 0.45, 0.65], haze: [0.60, 0.75, 0.035], sky: [0.58, 0.60, 0.10], acc: -0.48, sun: [0.12, 0.25, 1.4], light: 0.50, emis: 0.35 }, // coral & deep blue
+    { surf: [0.09, 0.35, 0.62], haze: [0.78, 0.50, 0.030], sky: [0.80, 0.45, 0.09], acc: -0.12, sun: [0.05, 0.55, 1.6], light: 0.90, emis: 0.3 }, // sandstone dusk
+  ];
+
   function biomeParams(seed, zoneIndex) {
     const zseed = hashCombine(seed, hashCombine(zoneIndex, 0xb10e));
     const r = (salt) => hash32(hashCombine(zseed, salt)) / 4294967296;
-    const hue = r(1);
+    const mood = MOODS[Math.floor(r(40) * MOODS.length)];
+    const hue = mood.surf[0] + (r(1) - 0.5) * 0.06;
     const styleRoll = r(2);
     // Each biome commits to one style (mixing styles within a biome shreds
     // connectivity); variety across biomes comes from anchors + palettes.
@@ -105,22 +127,39 @@
     return {
       hue,
       hueSpread: 0.06 + r(3) * 0.14,
-      sat: 0.35 + r(4) * 0.5,
+      sat: Math.max(0.05, mood.surf[1] + (r(4) - 0.5) * 0.16),
       styleBias,
       anchor,
       scaleBase: anchor.lo + r(7) * (anchor.hi - anchor.lo),
       twist: 0.015 + r(6) * 0.065,       // rotation magnitude (radians) — small!
       twistAxis: V.norm([r(18) * 2 - 1, r(19) * 2 - 1, r(20) * 2 - 1]),
       spread: 0.97 + r(9) * 0.05,        // fold offset spread (kept near canonical)
-      emissive: r(10) < 0.42,            // biome has glowing veins
-      fog: hsv(hue + 0.5 + (r(11) - 0.5) * 0.2, 0.45 + r(12) * 0.35, 0.09 + r(13) * 0.2),
-      sky: hsv(hue + 0.45 + (r(14) - 0.5) * 0.3, 0.4 + r(15) * 0.4, 0.2 + r(16) * 0.35),
-      lightHue: hue + 0.33 + r(17) * 0.34,
+      emissive: r(10) < mood.emis,       // biome has glowing veins
+      // DARK atmosphere: deep, saturated haze. Brightness in the distance
+      // comes from sunlight scattered in the haze (shader), not from a pale
+      // sky color — pale fog washed every frame out to pastel.
+      fog: hsv(mood.haze[0] + (r(11) - 0.5) * 0.05, mood.haze[1], mood.haze[2] * (0.8 + r(13) * 0.45)),
+      sky: hsv(mood.sky[0] + (r(14) - 0.5) * 0.05, mood.sky[1], mood.sky[2] * (0.8 + r(16) * 0.45)),
+      // the biome's sun: color/intensity from the mood, and a WORLD-anchored
+      // direction (elevation/azimuth) — all interpolated
+      // continuously with depth by World.mood()
+      sun: hsv(mood.sun[0], mood.sun[1], 1).map((v) => v * mood.sun[2] * (0.85 + r(30) * 0.3)),
+      sunW: (() => {
+        const el = 0.25 + r(31) * 0.95, az = r(32) * 6.2832;
+        return [Math.cos(el) * Math.cos(az), Math.sin(el), Math.cos(el) * Math.sin(az)];
+      })(),
+      // material accent: hue offset of the secondary (crevice / trap-region)
+      // color relative to the level palette
+      accent: mood.acc + (r(34) - 0.5) * 0.08,
+      lightHue: mood.light + (r(17) - 0.5) * 0.08,
       // 0 = dark biome (no auto lights — sun, veins and the headlight carry
       // it), 1 = sparse, 2 = lit. Dark stretches are the point: pools of
       // light only mean something next to real darkness.
       lightMode: r(21) < 0.3 ? 0 : r(21) < 0.72 ? 1 : 2,
-      valBase: 0.38 + r(22) * 0.3,       // palette value anchor (smoothed per level)
+      valBase: mood.surf[2] + (r(22) - 0.5) * 0.12, // palette value anchor (smoothed per level)
+      // haze extinction per decade of distance: clear biomes show colossal
+      // structure far above; thick ones feel close and mysterious
+      haze: 0.12 + r(28) * 0.22,
       // Offset fold planes (MENGER/OCTA only — see world.js evalFold): the
       // direction is a biome trait, the magnitude drifts per level. Band
       // validated via stylecheck: solid through 0.4*(s-1), eroding beyond.
@@ -248,14 +287,23 @@
     const lightOff = [sr(23), sr(24) * 0.6 + 0.25, sr(25)]; // fallback spawn offset
     const lightInt = 0.08 + r(26) * 0.18;
 
+    // accent hue offset glides across zone edges like the palette tracks
+    const accent = zt < 0.5
+      ? (bPrev.accent + biome.accent) / 2 + (biome.accent - (bPrev.accent + biome.accent) / 2) * ease(zt * 2)
+      : biome.accent + ((biome.accent + bNext.accent) / 2 - biome.accent) * ease((zt - 0.5) * 2);
+
+    // vein glow hue: the mood's light hue (vivid bioluminescence, never the
+    // possibly-pale surface color — pale palettes glowed as white blotches)
+    const glowHue = biome.lightHue + sr(35) * 0.03;
+
     return {
       level: j, zone: zone.index, biome, style, scale, rot, trans, foldL, foldOff,
-      pal, emissive,
+      pal, emissive, accent, glowHue,
       light: { spawn: lightSpawn, col: lightCol, off: lightOff, intensity: lightInt },
     };
   }
 
-  const LevelGen = { hash32, hashCombine, rnd, srnd, hsv, mixHue, levelParams, zoneOf, biomeParams,
+  const LevelGen = { MOODS, hash32, hashCombine, rnd, srnd, hsv, mixHue, levelParams, zoneOf, biomeParams,
     STYLE_POLY, STYLE_MENGER, STYLE_OCTA, STYLE_ICOSA, STYLE_TGLAD, STYLE_ANCHOR };
   global.LevelGen = LevelGen;
   if (typeof module !== 'undefined' && module.exports) module.exports = LevelGen;

@@ -26,6 +26,9 @@
   const helpBox = document.getElementById('help');
 
   window.__SHADER_DEBUG = params.get('sdbg') || '';
+  // look-dev overrides for the lighting/grade constants (see LOOK_DEFAULTS
+  // in shaders.js), e.g. ?look={"fill":0.5,"exposure":1.1}
+  try { if (params.get('look')) window.__LOOK = JSON.parse(params.get('look')); } catch (e) { /* ignore */ }
   let renderer;
   try {
     renderer = new window.Renderer(canvas);
@@ -98,7 +101,6 @@
     glow: 1.0,
     auto: false,
     paused: false,
-    sunCol: [1.0, 0.93, 0.82],
     deCam: world.de(world.camPos),
     lightColIdx: 0,
   };
@@ -192,14 +194,16 @@
       const de = world.de(world.camPos);
       const step = Math.min(remaining, Math.max(de - MIN_DE * 0.5, 0) * 0.75);
       if (step <= 1e-9) break;
-      world.camPos = V.add(world.camPos, V.scale(dir, step));
+      // moveCamera sub-steps across fold creases and returns the direction
+      // re-charted by any mirror correction on the way (keep flying straight)
+      dir = world.moveCamera(V.scale(dir, step)) || dir;
       remaining -= step;
     }
     // gentle push-out if we ended up too close
     const de = world.de(world.camPos);
     if (de < MIN_DE) {
       const g = world.grad(world.camPos);
-      world.camPos = V.add(world.camPos, V.scale(g, (MIN_DE - de) * 0.9));
+      world.moveCamera(V.scale(g, (MIN_DE - de) * 0.9));
     }
   }
 
@@ -326,7 +330,7 @@
     const t0 = performance.now();
     renderer.render(world, cam, {
       time: now / 1000, fov: state.fov, quality: state.quality,
-      sunCol: state.sunCol, glow: state.glow, deCam: state.deCam, still,
+      glow: state.glow, deCam: state.deCam, still,
     });
     const frameMs = performance.now() - t0 + dt * 0; // render cost only
     if (!still) renderer.adaptResolution(Math.max(frameMs, dt * 1000 * 0.5));
@@ -367,7 +371,7 @@
       renderOnce() {
         renderer.render(world, cam, {
           time: 1.0, fov: state.fov, quality: state.quality,
-          sunCol: state.sunCol, glow: state.glow, deCam: world.de(world.camPos),
+          glow: state.glow, deCam: world.de(world.camPos),
         });
         renderer.gl.finish();
       },
@@ -375,7 +379,7 @@
       gpuMap(p) {
         renderer.render(world, cam, {
           time: 1.0, fov: state.fov, quality: state.quality,
-          sunCol: state.sunCol, glow: state.glow, probe: p, deCam: world.de(world.camPos),
+          glow: state.glow, probe: p, deCam: world.de(world.camPos),
         });
         const gl = renderer.gl;
         const px = new Uint8Array(16);
