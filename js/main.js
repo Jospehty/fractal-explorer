@@ -208,26 +208,37 @@
   }
 
   /* ---- autopilot: probe candidates, steer toward interesting descent ---- */
-  const auto = { dir: null, timer: 0 };
+  /* Stall detection: greedy DE descent can circle forever in a basin of the
+     distance estimator (a local minimum of the lower bound, common in dusty
+     offset-fold regions). If continuous depth stops increasing, probe wide
+     and far for a while to find a way down. */
+  const auto = { dir: null, timer: 0, bestDepth: -Infinity, sinceProgress: 0, escape: 0 };
   let autoRs = seed ^ 0x5bd1e995;
   function autoRnd() { autoRs = (Math.imul(autoRs, 1103515245) + 12345) >>> 0; return autoRs / 4294967296; }
   function autopilot(dt) {
     auto.timer -= dt;
     const de = state.deCam;
     if (!auto.dir) auto.dir = cam.forward.slice();
+    const depth = world.depthZoom(de);
+    if (depth > auto.bestDepth + 0.05) { auto.bestDepth = depth; auto.sinceProgress = 0; }
+    else auto.sinceProgress += dt;
+    if (auto.sinceProgress > 5 && auto.escape <= 0) { auto.escape = 2.5; auto.sinceProgress = 0; }
+    auto.escape -= dt;
+    const escaping = auto.escape > 0;
     if (auto.timer <= 0) {
       auto.timer = 0.3;
       // candidates in a cone around current heading + a few wild ones
+      // (escaping a stall: all wild, probing much farther out)
       let best = null, bestScore = -Infinity;
       for (let i = 0; i < 12; i++) {
-        const wild = i >= 9;
+        const wild = escaping || i >= 9;
         const spread = wild ? 1.0 : 0.35;
         let d = V.norm(V.add(auto.dir, [
           (autoRnd() * 2 - 1) * spread,
           (autoRnd() * 2 - 1) * spread,
           (autoRnd() * 2 - 1) * spread,
         ]));
-        const probe = V.add(world.camPos, V.scale(d, de * 2.2));
+        const probe = V.add(world.camPos, V.scale(d, de * (escaping ? 6 + autoRnd() * 14 : 2.2)));
         const pd = world.de(probe);
         if (pd < 0) continue;
         // prefer descending DE but not straight into a wall; keep momentum
