@@ -50,8 +50,10 @@ Install the **Live Server** extension, right-click `index.html`, and select
 | P | pause |
 
 **Screenshots:** hold perfectly still. The renderer detects a static camera,
-ramps to full resolution and accumulates sub-pixel-jittered frames into a
-supersampled, shimmer-free image (the HUD shows `still ×N` while converging).
+switches to full resolution and accumulates sub-pixel-jittered samples into a
+supersampled, shimmer-free image (the HUD shows `still ×N` completed samples).
+Samples are rendered PROGRESSIVELY — a band of rows per frame, sized to a
+~20 ms budget — so stopping never stalls the page on any GPU.
 The held image also *refines*: after ~8 frames it switches to half the level-
 of-detail footprint, a bigger step budget and high-quality shadows, and after
 ~40 frames halves the footprint again — each switch fades in (the
@@ -98,6 +100,15 @@ version:
   (backward recursion `R_j = (R_{j+1} + |t_j|)/s_j + 2|o_j|`, per absolute
   level), so a point's distance is identical before and after a rebase even
   when biomes with very different shapes meet.
+- **Performance control.** Dynamic resolution is driven by real GPU time
+  (`EXT_disjoint_timer_query_webgl2`) or the frame interval, shrinking in
+  proportion to the overload (a slow GPU settles within a few frames) and
+  growing back slowly under a ceiling; if even the minimum resolution is too
+  slow, quality steps down automatically. Weak/integrated GPUs start at
+  quality 0 (no shadows/AO). Only the fast shader variant compiles at
+  startup; the perturbative one compiles in the background
+  (`KHR_parallel_shader_compile`). Outer-level skipping uses a binary search,
+  and the per-pixel coloring pass skips levels too coarse to matter.
 - **Over-relaxed marching** (Keinert et al. 2014): primary rays step 1.25x
   the safe distance while consecutive spheres overlap, falling back safely
   when they don't.

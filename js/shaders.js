@@ -303,6 +303,27 @@
     return c * (em * v * fade * 0.6);
   }
 
+  /* Number of leading outer levels a sample at squared camera distance pp
+     is linear through (R_b is nonincreasing): binary search with the two
+     common cases first — inside RLin (all levels linear: the outer phase
+     vanishes) or beyond R_0 (none). A linear scan cost up to 48 UBO reads
+     per DE call at deep zoom. */
+  int skipLinear(float pp) {
+    if (uB == 0) return 0;
+    float Rl = outerData[(uB - 1) * OV].w;
+    if (pp < Rl * Rl) return uB;
+    float R0 = outerData[0].w;
+    if (pp >= R0 * R0) return 0;
+    int lo = 0, hi = uB - 1;                 // linear through lo, not through hi
+    for (int it = 0; it < 7; it++) {
+      if (hi - lo <= 1) break;
+      int mid = (lo + hi) / 2;
+      float R = outerData[mid * OV].w;
+      if (pp < R * R) lo = mid; else hi = mid;
+    }
+    return hi;
+  }
+
   float map(vec3 p, float coneEps, float tView, out vec4 trapOut, out vec3 glow) {
     vec3 x = vec3(0.0);
     float dr;
@@ -313,9 +334,28 @@
     vec3 glowAcc = vec3(0.0);
     float pixT = coneEps / 0.22; // pixel footprint at the hit (t * pix)
     if (uB > 0) {
-      vec3 d = uW * p;
-      dr = uWScale;
-      int bStart = 0; // traps need every level: no skipping here
+      /* Skip leading levels that are BOTH linear here and far too coarse to
+         color or glow at this viewing distance (features > 256x the view
+         distance: trap penalty >= 1.5, veins faded out) — at deep zoom this
+         was most of the window, walked once per pixel. */
+      int bStart = skipLinear(dot(p, p));
+      if (bStart > 0) {
+        int lo = 0, hi = bStart;  // count levels with drAfter * tView < 1/256
+        for (int it = 0; it < 7; it++) {
+          if (lo >= hi) break;
+          int mid = (lo + hi) / 2;
+          if (outerData[mid * OV + 1].w * tView < 0.00390625) lo = mid + 1; else hi = mid;
+        }
+        bStart = min(bStart, lo);
+        if (bStart >= uB) bStart = uB - 1; // keep at least the last level's traps
+      }
+      vec3 d;
+      if (bStart == 0) { d = uW * p; dr = uWScale; }
+      else {
+        int q = bStart - 1;
+        d = mat3(outerData[q*OV+6].xyz, outerData[q*OV+7].xyz, outerData[q*OV+8].xyz) * p;
+        dr = outerData[q*OV+1].w;
+      }
       // Trap sampling through ALL outer levels keeps coloring anchored to
       // ABSOLUTE levels (with the scale-aware penalty — see trapPenalty)
       ${OUTER(`float ms = length(xs) * 0.9 + 0.12 * abs(xs.y) + trapPenalty(dr, tView);
@@ -364,14 +404,7 @@
     bool esc = false;
     // skip the leading outer levels this sample is linear through: R_b is
     // nonincreasing, so count while |p| < R_b (see world.js, per-level skip)
-    float pp = dot(p, p);
-    int bStart = 0;
-    for (int b = 0; b < B_HARD; b++) {
-      if (b >= uB) break;
-      float R = outerData[b*OV].w;
-      if (pp >= R * R) break;
-      bStart = b + 1;
-    }
+    int bStart = skipLinear(dot(p, p));
     if (bStart < uB) {
       vec3 d;
       if (bStart == 0) { d = uW * p; dr = uWScale; }
@@ -430,13 +463,13 @@
       if (i >= steps || t >= tmax) break;
       // LOD cone widens along the ray: a soft penumbra cannot resolve fine
       // detail far from the surface, and coarser DE evaluations are cheaper
-      float h = mapD(ro + rd * t, coneEps + t * 0.015);
+      float h = mapD(ro + rd * t, coneEps * 2.0 + t * 0.03);
       if (h < 1e-6 * t) return 0.0;
       res = min(res, k * h / t);
       if (res < 0.015) return 0.0; // effectively occluded: stop paying
       // minimum step grows with distance travelled (a cone): penumbrae are
       // soft far from the surface, so fine steps there were wasted work
-      t += clamp(h, max(t0 * 0.5, t * 0.06), tmax * 0.12);
+      t += clamp(h, max(t0 * 0.5, t * 0.1), tmax * 0.15);
     }
     return clamp(res, 0.0, 1.0);
   }
@@ -446,7 +479,7 @@
     // 4 taps spanning the same radius as the old 5 (weights renormalized)
     for (int i = 0; i < 4; i++) {
       float h = (0.01 + 0.173 * float(i)) * scale;
-      float d = mapD(p + n * h, coneEps + h * 0.2);
+      float d = mapD(p + n * h, coneEps * 1.5 + h * 0.25);
       occ += (h - d) * sca / scale;
       sca *= 0.66;
     }
@@ -613,7 +646,8 @@
       // NOTE every absolute length here divides by uFogMul (or multiplies,
       // for extinctions): plain frame-unit constants rescale by s at every
       // rebase and used to make shadows/AO/headlight visibly pop per zoom step
-      float ao = calcAO(p, n, max(t * 0.05, 0.02 / uFogMul), coneEps);
+      // quality 0 (weak GPUs) skips AO: 4 DE evaluations per pixel
+      float ao = uQuality >= 1 ? calcAO(p, n, max(t * 0.05, 0.02 / uFogMul), coneEps) : 0.85;
       float ao2 = ao * ao;
       float sunDiff = max(dot(n, uSunDir), 0.0);
       float sh = 1.0;
@@ -623,7 +657,7 @@
         // structure. Unlimited reach let the colossal parent levels above
         // you shadow EVERYTHING deep down, leaving interiors flat fill-lit;
         // the colossi get their depth from the haze instead.
-        sh = softShadow(p + n * eps * 3.0, uSunDir, eps * 8.0, max(12.0 / uFogMul, t * 0.6), 9.0, coneEps, uQuality == 1 ? 28 : 64);
+        sh = softShadow(p + n * eps * 3.0, uSunDir, eps * 8.0, max(12.0 / uFogMul, t * 0.6), 9.0, coneEps, uQuality == 1 ? 22 : 64);
       }
       vec3 hv = normalize(uSunDir - rd);
       float spec = pow(max(dot(n, hv), 0.0), 42.0) * 0.45;
@@ -762,7 +796,17 @@
     fragColor = mix(texelFetch(uPrev, px, 0), texelFetch(uSrc, px, 0), uBlend);
   }`;
 
-  const Shaders = { VERT, FRAG, BLIT_FRAG, LOOK_DEFAULTS };
+  /* Bilinear upscale of the last LIVE frame into the still accumulator, so
+     rows the progressive refinement has not reached yet show the live image
+     instead of nothing. */
+  const UPSCALE_FRAG = `#version 300 es
+  precision highp float;
+  uniform sampler2D uSrc;
+  uniform vec2 uDst;
+  out vec4 fragColor;
+  void main() { fragColor = texture(uSrc, gl_FragCoord.xy / uDst); }`;
+
+  const Shaders = { VERT, FRAG, BLIT_FRAG, UPSCALE_FRAG, LOOK_DEFAULTS };
   global.Shaders = Shaders;
   if (typeof module !== 'undefined' && module.exports) module.exports = Shaders;
 })(typeof window !== 'undefined' ? window : globalThis);

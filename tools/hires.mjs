@@ -50,17 +50,20 @@ await page.evaluate(async ({ K, view, opt }) => {
   if (opt.look) ex.renderer.setLook(opt.look);
 }, { K: +K, view, opt });
 const t0 = Date.now();
-for (let i = 0; i < +frames; i++) {
-  await page.evaluate(() => {
+// still frames render progressively (a band of rows per call): call until
+// `frames` complete samples are accumulated
+await page.evaluate(() => { window.__explorer.renderer.forceStage = 2; }); // finest refinement from the start
+let done = 0, calls = 0;
+while (done < +frames) {
+  done = await page.evaluate(() => {
     const ex = window.__explorer, R = ex.renderer;
-    // start straight at the finest refinement stage
-    if (R.stillFrames < 40) R.stillFrames = 40;
     R.render(ex.world, ex.cam, { time: 1, fov: ex.state.fov, quality: 2, glow: 1,
       deCam: ex.world.de(ex.world.camPos), still: true });
     const gl = R.gl, px = new Uint8Array(4);
     gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px); // sync
+    return R.accumN;
   });
-  if (i === 0) console.log(`frame 1 took ${((Date.now() - t0) / 1000).toFixed(0)}s`);
+  if (++calls === 1) console.log(`first band took ${((Date.now() - t0) / 1000).toFixed(0)}s`);
 }
 await page.screenshot({ path: out });
 console.log('wrote', out, `${((Date.now() - t0) / 1000).toFixed(0)}s`);

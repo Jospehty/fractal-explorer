@@ -37,6 +37,18 @@
     return;
   }
 
+  // Weak / integrated GPUs start at low quality and resolution (the
+  // resolution controller then finds the right size within a few frames).
+  // Keys 1/2/3 still set quality explicitly.
+  let weakGpu = false;
+  try {
+    const gl = renderer.gl;
+    const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+    const name = String(gl.getParameter(dbg ? dbg.UNMASKED_RENDERER_WEBGL : gl.RENDERER));
+    weakGpu = /Intel|UHD|Iris|Mali|Adreno|PowerVR|SwiftShader|llvmpipe|Microsoft Basic/i.test(name);
+  } catch (e) { /* unknown GPU: assume capable */ }
+  if (weakGpu && !DET) renderer.resScale = 0.3;
+
   if (params.get('canon')) window.LevelGen.CANON = true;
   if (params.get('style') !== null && params.get('style') !== undefined && params.get('style') !== '') {
     window.LevelGen.OVERRIDE = {
@@ -98,7 +110,7 @@
 
   const input = new window.Input(canvas);
   const state = {
-    quality: 1,
+    quality: weakGpu && !DET ? 0 : 1,
     fov: 1.15,
     glow: 1.0,
     auto: false,
@@ -397,6 +409,7 @@
   let fpsEma = 60;
   function frame(now) {
     requestAnimationFrame(frame);
+    const dtRawMs = now - last; // real frame interval (resolution control)
     let dt = Math.min((now - last) / 1000, 0.1);
     last = now;
     if (state.paused) return;
@@ -459,18 +472,26 @@
     // supersampled screenshots); any input, motion or rebase resets it
     const still = !moving && !yd && !pd && !roll && !rotApplied;
 
-    const t0 = performance.now();
     renderer.render(world, cam, {
       time: now / 1000, fov: state.fov, quality: state.quality,
       glow: state.glow, deCam: state.deCam, still,
     });
-    const frameMs = performance.now() - t0 + dt * 0; // render cost only
-    if (!still) renderer.adaptResolution(Math.max(frameMs, dt * 1000 * 0.5));
+    // resolution control from REAL cost (GPU timer, else frame interval —
+    // never CPU submit time, which is ~0 for WebGL)
+    if (!still) renderer.adaptResolution(dtRawMs);
+    // even the minimum resolution too slow for a while: step quality down
+    if (renderer.overloadSec > 1.5 && state.quality > 0) {
+      state.quality--;
+      renderer.overloadSec = 0;
+      flashMsg('quality ' + (state.quality + 1) + ' for speed (keys 1/2/3 to change)');
+    }
 
     fpsEma = fpsEma * 0.95 + (1 / Math.max(dt, 1e-3)) * 0.05;
     updateHUD(dt, fpsEma);
   }
   if (!DET) requestAnimationFrame(frame);
+  // debugging handle (console / headless diagnostics)
+  window.__app = { world, renderer, state, cam };
 
   /* ---- deterministic hooks for automated tests/screenshots ---- */
   if (DET) {
