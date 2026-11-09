@@ -61,6 +61,8 @@
       foldoff: parseFloat(params.get('foldoff')) || 0,
       n: parseInt(params.get('n') || '5', 10),
       h: params.get('h') !== null ? parseFloat(params.get('h')) : 0.5,
+      py: params.get('py') !== null ? parseFloat(params.get('py')) : undefined,
+      sub: parseInt(params.get('sub') || '1', 10),
     };
   }
   const world = new WM.World(seed);
@@ -357,25 +359,41 @@
     const escaping = auto.escape > 0;
     if (auto.timer <= 0) {
       auto.timer = 0.3;
-      // candidates in a cone around current heading + a few wild ones
-      // (escaping a stall: all wild, probing much farther out)
+      /* Steer toward REAL surfaces: sphere-trace a fan of rays (a cone
+         around the heading plus a few wild ones) and head for the nearest
+         hit, with a little momentum. Approaching an actual surface always
+         drives the distance to zero, so the dive always zooms. (Following
+         the distance estimate's gradient got trapped in its basins in sparse
+         worlds — trees, membranes.) A stall widens the fan. */
       let best = null, bestScore = -Infinity;
-      for (let i = 0; i < 12; i++) {
-        const wild = escaping || i >= 9;
-        const spread = wild ? 1.0 : 0.35;
-        let d = V.norm(V.add(auto.dir, [
-          (autoRnd() * 2 - 1) * spread,
-          (autoRnd() * 2 - 1) * spread,
-          (autoRnd() * 2 - 1) * spread,
-        ]));
-        const probe = V.add(world.camPos, V.scale(d, de * (escaping ? 6 + autoRnd() * 14 : 2.2)));
-        const pd = world.de(probe);
-        if (pd < 0) continue;
-        // prefer descending DE but not straight into a wall; keep momentum
-        const score = -pd / de + V.dot(d, auto.dir) * 0.35 + (wild ? 0.05 : 0);
+      const reach = de * (escaping ? 400 : 120);
+      // the deeper attractor's bounding ball: where the finer structure
+      // actually lives (zone handovers can leave the camera in a pruned gap
+      // whose distance bound is loose, with nothing hittable around it)
+      const ball = world.ballAfter(world.K - 1);
+      const toBall = V.sub(ball.C, world.camPos);
+      const ballDist = V.len(toBall);
+      for (let i = 0; i < 13; i++) {
+        const wild = escaping || i >= 8;
+        const spread = wild ? 1.2 : 0.45;
+        const d = i === 12
+          ? (ballDist > 1e-9 ? V.scale(toBall, 1 / ballDist) : auto.dir)
+          : V.norm(V.add(auto.dir, [
+            (autoRnd() * 2 - 1) * spread,
+            (autoRnd() * 2 - 1) * spread,
+            (autoRnd() * 2 - 1) * spread,
+          ]));
+        const th = world.rayHit(world.camPos, d, i === 12 ? Math.max(reach, ballDist + ball.R) : reach, de * 0.05);
+        if (!Number.isFinite(th)) continue;
+        const score = -Math.log(th / de) + V.dot(d, auto.dir) * 0.6 + (wild ? -0.2 : 0);
         if (score > bestScore) { bestScore = score; best = d; }
       }
       if (best) auto.dir = best;
+      else if (escaping) {
+        auto.dir = ballDist > ball.R && autoRnd() < 0.5
+          ? V.scale(toBall, 1 / ballDist)
+          : V.norm([autoRnd() - 0.5, autoRnd() - 0.5, autoRnd() - 0.5]);
+      }
     }
     // steer camera smoothly toward auto.dir
     const cur = cam.forward;

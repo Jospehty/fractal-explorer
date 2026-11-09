@@ -52,6 +52,8 @@
   const STYLE_ICOSA = 3;  // icosahedral kaleidoscope (H3)      -> rounded organic shells
   const STYLE_DIHEDRAL = 4; // n-fold radial kaleidoscope (D_n x Z2) + axial twist
                             //                                   -> spirals, petals, coral, arches
+  const STYLE_BRANCH = 5;   // 1-2 mirror planes + strong rotation (KIFS "tree")
+                            //                                   -> trunks, branches, roots, fronds
 
   /* DIHEDRAL geometry: order n (3..7), the copy center c = (cos a, sin a, h)
      on the wedge bisector a = pi/(2n) (copies form 2 rings of 2n), and the
@@ -74,17 +76,37 @@
      and s=3 for MENGER-family; bands stay strictly below critical or the
      attractor disconnects. */
   const STYLE_ANCHOR = [
-    { lo: 1.78, hi: 1.97, pull: [1.0, 1.0, 1.0] },   // POLY (tetra, ~4 copies)
+    { lo: 1.66, hi: 1.78, pull: [1.0, 1.0, 1.0] },   // POLY (tetra, ~4 copies). Measured
+                                                     // solidity (ray hits): 90% at 1.70,
+                                                     // <50% above 1.88 — sandy dust walls
     { lo: 2.50, hi: 2.95, pull: [1.0, 1.0, 0.52] },  // MENGER (many copies)
     { lo: 2.15, hi: 2.52, pull: [1.0, 0.82, 0.45] }, // OCTA
     { lo: 1.84, hi: 1.99, pull: [1.0, 0.9, 0.65] },  // ICOSA (stylecheck: solid at 1.86,
                                                      // stringy by 2.05 — keep below)
     { lo: 2.95, hi: 3.45, pull: null },              // DIHEDRAL (pull from dihedral(n, h))
+    { lo: 1.5, hi: 1.9, pull: [1.0, 0.45, 0.6] },    // BRANCH (provisional — tuned visually)
+  ];
+
+  /* BRANCH presets (visually validated): sub-step scale range s, mirrors k,
+     sub-steps per level m (level scale s^m), twist range (radians), pull y/z.
+       cauliflower — romanesco / brain-coral clusters, fractal at every scale
+       membrane    — smooth curved sheets torn with slits, alien skin
+       lichen      — dense crinkled coral crust
+     (Single-mirror "horn" forms looked great from outside but are thread-
+     thin dust inside: excluded.)
+     twMin / hr are hard limits on the EFFECTIVE per-level values (after the
+     depth drift), measured as ray-hit density sweeps: cauliflower collapses
+     to dust below twist ~1.15 (hit rate 0.3 -> 0.02 at 0.8), membrane above
+     h ~0.7. Keep every drifted level inside these. */
+  const BRANCH_PRESETS = [
+    { name: 'cauliflower', k: 1, m: 3, s: [1.26, 1.3], tw: [1.2, 1.45], twMin: 1.15, py: 0.45, h: 0.6, hr: [0.48, 0.72] },
+    { name: 'membrane', k: 2, m: 2, s: [1.28, 1.33], tw: [0.65, 0.9], twMin: 0.5, py: 0.45, h: 0.55, hr: [0.45, 0.62] },
+    { name: 'lichen', k: 2, m: 1, s: [1.58, 1.66], tw: [0.85, 1.1], twMin: 0.65, py: 0.45, h: 0.6, hr: [0.48, 0.72] },
   ];
 
   // Biome: a run of consecutive levels sharing stylistic biases.
   // Deterministic biome segmentation: walk zone boundaries from a hash chain.
-  const ZONE_MIN = 5, ZONE_VAR = 6;
+  const ZONE_MIN = 4, ZONE_VAR = 5;
   function zoneOf(seed, j) {
     // Zone lengths are hash(zoneIndex)-dependent; find which zone j falls in by
     // walking from level 0. Cache per seed for O(1) amortized lookups.
@@ -137,11 +159,24 @@
     // connectivity); variety across biomes comes from anchors + palettes.
     // DIHEDRAL gets the largest share: its porous, spiralling, cavernous
     // terrain is the most "natural"; the rest keep architectural variety
-    const styleBias = styleRoll < 0.3 ? STYLE_DIHEDRAL
-      : styleRoll < 0.52 ? STYLE_MENGER
-      : styleRoll < 0.68 ? STYLE_POLY
-      : styleRoll < 0.86 ? STYLE_ICOSA : STYLE_OCTA;
+    // The organic families (BRANCH, DIHEDRAL) get most of the dive; the
+    // architectural ones stay for contrast.
+    const styleBias = styleRoll < 0.3 ? STYLE_BRANCH
+      : styleRoll < 0.55 ? STYLE_DIHEDRAL
+      : styleRoll < 0.7 ? STYLE_MENGER
+      : styleRoll < 0.8 ? STYLE_POLY
+      : styleRoll < 0.92 ? STYLE_ICOSA : STYLE_OCTA;
     const anchor = STYLE_ANCHOR[styleBias];
+    // BRANCH biome: one of the visually validated presets, jittered
+    const brP = styleBias === STYLE_BRANCH ? BRANCH_PRESETS[Math.floor(r(43) * BRANCH_PRESETS.length)] : null;
+    const br = brP ? {
+      name: brP.name,
+      k: brP.k, m: brP.m,
+      s: brP.s[0] + r(44) * (brP.s[1] - brP.s[0]),
+      twist: brP.tw[0] + r(45) * (brP.tw[1] - brP.tw[0]),
+      twMin: brP.twMin, hr: brP.hr,
+      pull: [1.0, brP.py + (r(46) - 0.5) * 0.2, brP.h + (r(47) - 0.5) * 0.3],
+    } : null;
     // DIHEDRAL biome shape: order n, ring height h (validated visually:
     // solid drums below s~2.8, porous tori/coral 2.95-3.5, spiral detail
     // from the axial twist)
@@ -153,14 +188,21 @@
       sat: Math.max(0.05, mood.surf[1] + (r(4) - 0.5) * 0.16),
       styleBias,
       anchor,
-      scaleBase: anchor.lo + r(7) * (anchor.hi - anchor.lo),
+      scaleBase: br ? Math.pow(br.s, br.m) : anchor.lo + r(7) * (anchor.hi - anchor.lo),
       // rotation magnitude (radians) — small for the cubic styles (larger
       // tears them into dust); DIHEDRAL twists about its own axis, where
       // large angles stay connected and draw spirals across levels
-      twist: dih ? 0.2 + r(6) * 0.3 : 0.015 + r(6) * 0.065,
-      twistAxis: dih ? V.norm([(r(18) - 0.5) * 0.1, (r(19) - 0.5) * 0.1, 1])
+      twist: br ? br.twist : dih ? 0.2 + r(6) * 0.3 : 0.015 + r(6) * 0.065,
+      // BRANCH: the preset's validated axis, barely jittered — with a fold
+      // IFS only the part of each copy inside the fold image survives, and
+      // most random axes prune the tree down to dust (nothing to hit)
+      twistAxis: br ? V.norm([0.3 + (r(18) - 0.5) * 0.08, 0.9 + (r(19) - 0.5) * 0.08, 0.2 + (r(20) - 0.5) * 0.08])
+        : dih ? V.norm([(r(18) - 0.5) * 0.1, (r(19) - 0.5) * 0.1, 1])
         : V.norm([r(18) * 2 - 1, r(19) * 2 - 1, r(20) * 2 - 1]),
       dih,
+      br,
+      // phase of the smooth per-level shape drift (see levelParams)
+      driftPhase: r(48) * 6.2832,
       spread: 0.97 + r(9) * 0.05,        // fold offset spread (kept near canonical)
       emissive: r(10) < mood.emis,       // biome has glowing veins
       // DARK atmosphere: deep, saturated haze. Brightness in the distance
@@ -220,16 +262,19 @@
       const s = o.scale && !o.alt ? o.scale : (anchor.lo + anchor.hi) / 2;
       const k = (s - 1) * (o.spread || 1);
       const dh = style === STYLE_DIHEDRAL ? dihedral(o.n || 5, o.h !== undefined ? o.h : 0.5) : null;
-      const pull = dh ? dh.pull : anchor.pull;
+      const br = style === STYLE_BRANCH;
+      const pull = dh ? dh.pull : br ? [1.0, o.py !== undefined ? o.py : 0.45, o.h !== undefined ? o.h : 0.6] : anchor.pull;
       // DIHEDRAL twists about its symmetry axis (spirals); others about a fixed tilt
       const rot = twist ? V.mAxisAngle(dh ? [0, 0, 1] : V.norm([0.3, 0.9, 0.2]), twist) : V.mIdent();
       const foDir = V.norm([0.55, 0.8, 0.25]);
       const foMag = dh ? 0 : (o.foldoff || 0) * (s - 1);
       return {
         level: j, zone: 0, biome: biomeParams(seed, 0),
-        style, scale: s, rot,
+        style, scale: br && o.sub > 1 ? Math.pow(s, o.sub) : s, rot,
         trans: [-k * pull[0] * pullMod[0], -k * pull[1] * pullMod[1], -k * pull[2] * pullMod[2]],
-        foldL: 1, foldN: dh ? dh.foldN : 0, dihN: dh ? dh.dihN : null,
+        foldL: 1, foldN: dh ? dh.foldN : br ? Math.min(2, Math.max(1, o.n || 1)) : 0, dihN: dh ? dh.dihN : null,
+        // BRANCH composite: ?sub=m repeats the step m times per level
+        subM: br && o.sub > 1 ? o.sub : 1, subS: br && o.sub > 1 ? s : undefined,
         foldOff: [foDir[0] * foMag, foDir[1] * foMag, foDir[2] * foMag],
         pal: hsv(0.55 + 0.06 * (j % 4) + zone5 * 0.3, 0.5, 0.75), emissive: 0,
         light: { spawn: false, col: [1, 1, 1], off: [0, 0, 0], intensity: 0 },
@@ -262,11 +307,25 @@
     // Rotation: a coherent twist about the biome's FIXED axis. Per-level axis
     // wobble and large angles tear the attractor into dust — verified visually;
     // vary the amount only, gently, around the biome magnitude.
-    const ang = biome.twist * (0.75 + r(5) * 0.5);
+    // Organic styles DRIFT smoothly with depth inside their zone (twist and
+    // pull glide along a sine), so the forms keep evolving as you zoom
+    // instead of one recipe repeating for the whole zone.
+    const zlenD = Math.max(1, zone.end - zone.start);
+    const drift = Math.sin(2 * Math.PI * (j - zone.start) / Math.max(4, zlenD) + biome.driftPhase);
+    const organic = !!(biome.br || biome.dih);
+    let ang = organic
+      ? biome.twist * (1 + 0.18 * drift) * (0.95 + r(5) * 0.1)
+      : biome.twist * (0.75 + r(5) * 0.5);
+    if (biome.br) ang = Math.max(ang, biome.br.twMin);
     const rot = V.mAxisAngle(biome.twistAxis, ang);
 
-    const k = (scale - 1) * biome.spread;
-    const pull = biome.dih ? biome.dih.pull : biome.anchor.pull;
+    // translation: fixed point of the (sub-)step scale
+    const k = ((biome.br ? biome.br.s : scale) - 1) * biome.spread;
+    let pull = biome.br ? biome.br.pull : biome.dih ? biome.dih.pull : biome.anchor.pull;
+    if (biome.br) {
+      const hr = biome.br.hr;
+      pull = [pull[0], pull[1] + 0.08 * drift, Math.min(hr[1], Math.max(hr[0], pull[2] - 0.1 * drift))];
+    }
     const foldL = 1.0;
     const trans = [-k * pull[0], -k * pull[1], -k * pull[2]];
 
@@ -329,15 +388,17 @@
 
     return {
       level: j, zone: zone.index, biome, style, scale, rot, trans, foldL, foldOff,
-      foldN: biome.dih ? biome.dih.foldN : 0, dihN: biome.dih ? biome.dih.dihN : null,
+      foldN: biome.dih ? biome.dih.foldN : biome.br ? biome.br.k : 0,
+      dihN: biome.dih ? biome.dih.dihN : null,
+      subM: biome.br ? biome.br.m : 1, subS: biome.br && biome.br.m > 1 ? biome.br.s : undefined,
       pal, emissive, accent, glowHue,
       light: { spawn: lightSpawn, col: lightCol, off: lightOff, intensity: lightInt },
     };
   }
 
   const LevelGen = { MOODS, hash32, hashCombine, rnd, srnd, hsv, mixHue, levelParams, zoneOf, biomeParams,
-    STYLE_POLY, STYLE_MENGER, STYLE_OCTA, STYLE_ICOSA, STYLE_DIHEDRAL, STYLE_TGLAD, STYLE_ANCHOR,
-    dihedral };
+    STYLE_POLY, STYLE_MENGER, STYLE_OCTA, STYLE_ICOSA, STYLE_DIHEDRAL, STYLE_BRANCH, STYLE_TGLAD, STYLE_ANCHOR,
+    dihedral, BRANCH_PRESETS };
   global.LevelGen = LevelGen;
   if (typeof module !== 'undefined' && module.exports) module.exports = LevelGen;
 })(typeof window !== 'undefined' ? window : globalThis);

@@ -146,12 +146,13 @@
                              // continuous across the rebase rescale
 
   layout(std140) uniform Params {
-    vec4 lvl[SLOTS * LV];       // per slot (LV=7): rot0(w=scale) rot1(w=style) rot2(w=foldL|n) trans(w=emissive) pal(w=accent) foldOff|N2(w=glow hue) (bound after level)
+    vec4 lvl[SLOTS * LV];       // per slot (LV=8): rot0(w=scale) rot1(w=style) rot2(w=foldL|n) trans(w=emissive) pal(w=accent) foldOff|N2(w=glow hue) (bound after level)
     vec4 outerData[B_HARD * OV]; // per outer: jac0 jac1 jac2 (c.xyz, margin) stages0-3 stages4-7
   };
 
-  // attractor bounding radius after slot s's fold (world.js boundAfter)
-  float bnd(int s) { return lvl[s*LV+6].x; }
+  // distance bound to the attractor's bounding ball after slot s's fold
+  // (center, radius — world.js ballAfter)
+  float ballDist(vec3 x, int s) { vec4 B = lvl[s*LV+7]; return length(x - B.xyz) - B.w; }
 
   /* ---- the fold (mirror of world.js evalFold) ---- */
   vec3 foldLevel(vec3 x, int s) {
@@ -178,7 +179,7 @@
       x -= 2.0 * min(0.0, dot(x, ICO_N)) * ICO_N;
       x = abs(x);
       x -= 2.0 * min(0.0, dot(x, ICO_N)) * ICO_N;
-    } else {                      // DIHEDRAL: z mirror + D_n wedge (alternating mirrors)
+    } else if (style < 4.5) {     // DIHEDRAL: z mirror + D_n wedge (alternating mirrors)
       x.z = abs(x.z);
       vec3 n2 = lvl[s*LV+5].xyz;
       int nOps = int(r2.w + 0.5);
@@ -188,6 +189,17 @@
         if ((k & 1) == 0) x.y = abs(x.y);   // N1 = y=0 plane (exact)
         else x -= 2.0 * min(0.0, dot(x, n2)) * n2;
       }
+    } else {                      // BRANCH: mirror x (and y): KIFS tree, composite level
+      mat3 R = mat3(r0.xyz, r1.xyz, r2.xyz);
+      float ss = lvl[s*LV+6].y;     // sub-step scale (level scale = ss^m)
+      int m = int(lvl[s*LV+6].z + 0.5);
+      for (int it = 0; it < 4; it++) {
+        if (it >= m) break;
+        if (it > 0) x = R * (x * ss + tr.xyz);
+        x.x = abs(x.x);
+        if (r2.w > 1.5) x.y = abs(x.y);
+      }
+      return x * ss + tr.xyz;
     }
     return x * r0.w + tr.xyz;
   }
@@ -245,7 +257,7 @@
       d = goldOp(d, stg(b, 3));
       absOp(d.x, stg(b, 4)); absOp(d.y, stg(b, 5)); absOp(d.z, stg(b, 6));
       d = goldOp(d, stg(b, 7));
-    } else {                      // DIHEDRAL
+    } else if (style < 4.5) {     // DIHEDRAL
       absOp(d.z, stg(b, 0));
       vec3 n2 = lvl[b*LV+5].xyz;
       int nOps = int(r2.w + 0.5);
@@ -255,6 +267,18 @@
         if ((k & 1) == 0) absOp(d.y, stg(b, k + 1)); // y=0 mirror == abs on y
         else d = planeOp(d, stg(b, k + 1), n2);
       }
+    } else {                      // BRANCH (composite level)
+      mat3 R = mat3(r0.xyz, r1.xyz, r2.xyz);
+      float ss = lvl[b*LV+6].y;
+      int m = int(lvl[b*LV+6].z + 0.5);
+      int kk = r2.w > 1.5 ? 2 : 1;
+      for (int it = 0; it < 4; it++) {
+        if (it >= m) break;
+        if (it > 0) d = R * (d * ss);
+        absOp(d.x, stg(b, it * kk));
+        if (kk > 1) absOp(d.y, stg(b, it * kk + 1));
+      }
+      return d * ss;
     }
     return d * r0.w;
   }
@@ -387,7 +411,7 @@
     // (|x| - R)/dr is a rigorous distance lower bound for any truncation depth
     // (R = bounding radius of the attractor after the last applied level,
     // per absolute level — see world.js boundAfter) — hole-free LOD.
-    return (length(x) - bnd(sl)) / dr;
+    return ballDist(x, sl) / dr;
   }
 
   /* Distance-only variant used for ALL marching, normal, AO and shadow
@@ -436,13 +460,13 @@
           int s2 = min(s + 1, SLOTS - 1);
           float sc = lvl[s2*LV].w;
           float f = clamp((dr * coneEps - 1.0) / max(sc - 1.0, 0.1), 0.0, 1.0);
-          float deA = (length(x) - bnd(s)) / dr;
-          float deB = (length(foldLevel(x, s2)) - bnd(s2)) / (dr * sc);
+          float deA = ballDist(x, s) / dr;
+          float deB = ballDist(foldLevel(x, s2), s2) / (dr * sc);
           return mix(deB, deA, f);
         }`}
       }
     }
-    return (length(x) - bnd(sl)) / dr;
+    return ballDist(x, sl) / dr;
   }
 
   float mapD(vec3 p, float coneEps) { return mapDE(p, coneEps); }
@@ -776,7 +800,10 @@
     // vignette + dither
     float vig = 1.0 - uLookD.y * dot(uv * 0.62, uv * 0.62);
     col *= vig;
-    col += (hash12(gl_FragCoord.xy + fract(uTime) * 61.7) - 0.5) / 255.0;
+    // triangular dither (+-1 LSB): dark haze gradients band visibly with
+    // the old +-0.5 LSB uniform dither
+    vec2 dseed = gl_FragCoord.xy + fract(uTime) * 61.7;
+    col += (hash12(dseed) + hash12(dseed + 17.31) - 1.0) / 255.0;
 
     fragColor = vec4(col, 1.0);
   }`; };

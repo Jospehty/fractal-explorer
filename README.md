@@ -75,9 +75,17 @@ version:
   `js/levelgen.js`. Levels are grouped into biomes that share a fold style and
   a curated color *mood* (abyssal teal & bone, ember cathedral, violet nebula,
   jade temple, glacier, copper & verdigris, obsidian & gold, coral, sandstone
-  dusk). Five fold styles: DIHEDRAL (an n-fold radial kaleidoscope, n = 4–7,
-  twisted about its axis level by level — porous coral caverns, overhangs,
-  tunnels and spirals; the most "natural" terrain), POLY (crystalline),
+  dusk). Six fold styles. The organic ones: BRANCH (a fold IFS that mirrors
+  only one or two axes, with a large twist — the copies grow off each other
+  like a plant; three presets: *cauliflower* romanesco/brain-coral clusters,
+  *membrane* torn curved sheets, *lichen* crinkled coral crust. A BRANCH
+  level can be a *composite* of m small sub-steps, so its shape is fractal
+  at every scale instead of one coarse jump per level) and DIHEDRAL (an
+  n-fold radial kaleidoscope, n = 4–7, twisted about its axis level by
+  level — porous coral caverns, overhangs, tunnels and spirals). Organic
+  biomes *drift*: their twist and pull glide along a sine through the zone,
+  so the forms keep evolving as you zoom instead of one recipe repeating.
+  The geometric ones: POLY (crystalline),
   MENGER (architectural), OCTA (canyons) and ICOSA (the icosahedral H3
   kaleidoscope — rounded, organic). MENGER/OCTA additionally use offset fold
   planes (the Mandelbox box-fold trick). Every fold op must be a pure reflection, and every fold must be
@@ -95,11 +103,18 @@ version:
   sample ever loses relative precision, however many levels (up to 48) lie
   between it and the camera. That is what allows a horizon of ~10^11 local
   units: structures ~10^10 times your size stay visible.
-- **Per-level bounding radius.** The distance estimate `(|x| - R)/dr` uses
-  the exact bounding radius of the attractor after the last applied level
-  (backward recursion `R_j = (R_{j+1} + |t_j|)/s_j + 2|o_j|`, per absolute
-  level), so a point's distance is identical before and after a rebase even
-  when biomes with very different shapes meet.
+- **Per-level bounding balls.** The distance estimate `(|x - C| - R)/dr`
+  uses a bounding ball (centre and radius) of the attractor after the last
+  applied level, derived per absolute level by backward recursion from a
+  fixed point far below. Off-centre balls matter for BRANCH, whose
+  attractors sit well away from the origin. A point's distance is identical
+  before and after a rebase, even where biomes with very different shapes
+  meet.
+- **Autopilot.** Sphere-traces a fan of rays and heads for the nearest real
+  hit, plus one ray aimed at the deeper attractor's bounding ball. Following
+  the distance gradient got trapped in basins, and in sparse organic worlds
+  the bound can be loose with nothing actually there. A 5 s stall widens the
+  fan.
 - **Performance control.** Dynamic resolution is driven by real GPU time
   (`EXT_disjoint_timer_query_webgl2`) or the frame interval, shrinking in
   proportion to the overload (a slow GPU settles within a few frames) and
@@ -211,6 +226,15 @@ dihedral style (order, ring height, scale, axial twist) ·
   identical: the `OUTER` template in `shaders.js`, `World.de` (float64), the
   float32 emulation in `test/world.test.js`, and `foldDelta` in both
   languages. The tests compare them bit-for-bit-ish at depths up to 10^48.
+- BRANCH presets (`BRANCH_PRESETS`): a fold IFS keeps only the part of each
+  copy inside the fold image, so most twist axes prune the tree to dust.
+  The axis is fixed near (0.3, 0.9, 0.2), and `twMin`/`hr` clamp the
+  *drifted* per-level twist and height, measured with ray-hit density
+  sweeps. Cauliflower turns to dust below twist ≈1.15, and membrane above
+  height ≈0.7. POLY is solid only at s = 1.66–1.78.
+- Small-scale styles (BRANCH ≈1.6–2 per level) can saturate the 48-level
+  window before the horizon. `World.windowReach` then raises the fog floor
+  so geometry beyond the window is always fully fogged.
 - DIHEDRAL connectivity band: solid drums below s≈2.8, porous tori and
   coral at 2.95–3.45 (`STYLE_ANCHOR`); n ≤ 7 so its fold fits in
   `MAX_STAGES` (1 + up to 7 mirror ops).

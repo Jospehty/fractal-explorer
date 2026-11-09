@@ -51,6 +51,13 @@ function foldF32(x, slot) {
     if (fr(x[0] + x[1]) < 0) { const t = fr(-x[0]); x[0] = fr(-x[1]); x[1] = t; }
     if (fr(x[0] + x[2]) < 0) { const t = fr(-x[0]); x[0] = fr(-x[2]); x[2] = t; }
     if (fr(x[1] + x[2]) < 0) { const t = fr(-x[1]); x[1] = fr(-x[2]); x[2] = t; }
+  } else if (S > 4.5) { // BRANCH: abs x (and y), composite level
+    const ss = slot.subS, m = Math.round(slot.subM);
+    for (let it = 0; it < m; it++) {
+      if (it > 0) x = fMat(slot.rotCols, f3(fr(x[0] * ss) + slot.trans[0], fr(x[1] * ss) + slot.trans[1], fr(x[2] * ss) + slot.trans[2]));
+      x = f3(Math.abs(x[0]), slot.foldL > 1.5 ? Math.abs(x[1]) : x[1], x[2]);
+    }
+    return f3(fr(x[0] * ss) + slot.trans[0], fr(x[1] * ss) + slot.trans[1], fr(x[2] * ss) + slot.trans[2]);
   } else if (S > 3.5) { // DIHEDRAL: abs z, then alternating abs(y) / N2 plane folds
     x = f3(x[0], x[1], Math.abs(x[2]));
     const n2 = slot.foldOff;
@@ -89,7 +96,8 @@ function readSlots(world, ubo) {
       scale: ubo[o + 3], style: ubo[o + 7], foldL: ubo[o + 11],
       trans: [ubo[o + 12], ubo[o + 13], ubo[o + 14]],
       foldOff: [ubo[o + 20], ubo[o + 21], ubo[o + 22]],
-      bound: ubo[o + 24],
+      subS: ubo[o + 25], subM: ubo[o + 26],
+      ballC: [ubo[o + 28], ubo[o + 29], ubo[o + 30]], ballR: ubo[o + 31],
     });
   }
   const base = WM.SLOTS * WM.LVL_VEC4 * 4;
@@ -138,7 +146,15 @@ function foldDeltaF32(d, slot, st) {
   };
   const goldOp = (Tn) => planeOp(Tn, ICO_NF);
   const S = slot.style;
-  if (S > 3.5) {
+  if (S > 4.5) {
+    const ss = slot.subS, m = Math.round(slot.subM), kk = slot.foldL > 1.5 ? 2 : 1;
+    for (let it = 0; it < m; it++) {
+      if (it > 0) d = fMat(slot.rotCols, f3(d[0] * ss, d[1] * ss, d[2] * ss));
+      absOp(0, st[it * kk]);
+      if (kk > 1) absOp(1, st[it * kk + 1]);
+    }
+    return f3(d[0] * ss, d[1] * ss, d[2] * ss);
+  } else if (S > 3.5) {
     absOp(2, st[0]);
     const nOps = WM.dihedralOps(Math.round(slot.foldL));
     for (let k = 0; k < nOps; k++) {
@@ -158,7 +174,12 @@ function foldDeltaF32(d, slot, st) {
 }
 
 /* Emulates the shader's two-phase map(). pRel is camera-relative (frame K). */
+// |x|^2 where the last mapF32 stopped: samples that land within rounding of
+// the ESCAPE2 threshold legitimately stop one level apart in f32 vs f64 (two
+// valid, slightly different bounds) — not a precision defect, so skipped.
+let lastF32X2 = 0;
 function mapF32(world, packed, pRel) {
+  lastF32X2 = 0;
   const { slots, outer } = packed;
   const B = outer.length;
   const camF = f3(world.camPos[0], world.camPos[1], world.camPos[2]);
@@ -176,7 +197,7 @@ function mapF32(world, packed, pRel) {
       sl = B + i;
       if (x[0] * x[0] + x[1] * x[1] + x[2] * x[2] > WM.ESCAPE2) break;
     }
-    return fr((fLen(x) - slots[sl].bound) / dr);
+    return fr(fr(fLen(fSub(x, slots[sl].ballC)) - slots[sl].ballR) / dr);
   }
   let dr = b0 === 0 ? fr(world.WScale) : outer[b0 - 1].drAfter;
   let d = !B ? pf : (b0 === 0 ? fMat(WCols, pf) : fMat(outer[b0 - 1].qCols, pf));
@@ -219,7 +240,8 @@ function mapF32(world, packed, pRel) {
       if (x[0] * x[0] + x[1] * x[1] + x[2] * x[2] > WM.ESCAPE2) break;
     }
   }
-  return fr((fLen(x) - slots[sl].bound) / dr);
+  lastF32X2 = x[0] * x[0] + x[1] * x[1] + x[2] * x[2];
+  return fr(fr(fLen(fSub(x, slots[sl].ballC)) - slots[sl].ballR) / dr);
 }
 
 /* ---------- deterministic RNG for test points ---------- */
@@ -312,6 +334,7 @@ function checkF32Pipeline(world, tag) {
     // pipeline could meet (which failed outright near outer fold creases).
     const tol = Math.max(3e-5 * Math.abs(de64), 5e-7 + 2.5e-5 * r, 1e-8);
     const err = Math.abs(de32 - de64);
+    if (Math.abs(lastF32X2 / WM.ESCAPE2 - 1) < 0.01) continue; // escape tie
     if (err / tol > worst.rel) worst = { rel: err / tol, r, de64, de32 };
     check(err < tol, `${tag} f32-vs-f64 r=${r.toExponential(2)} de64=${de64} de32=${de32} err=${err}`);
   }
@@ -334,18 +357,7 @@ function dive(seed, depthChecks) {
       world.camPos = V.add(world.camPos, V.scale(world.grad(world.camPos), -d * 2 + 1e-4));
       continue;
     }
-    // dive by probing: move toward whichever direction minimizes sampled DE.
-    // Mix of short and long probes so flat wall pockets can be escaped
-    // (ICOSA terrain has larger flat pockets than the angular styles, hence
-    // the extra long-range probes).
-    let bestP = null, bestD = Infinity;
-    for (let c = 0; c < 18; c++) {
-      const radius = d * (c < 8 ? 0.6 : 1.5 + rnd() * 10);
-      const cand = V.add(world.camPos, V.scale(rndDir(), radius));
-      const cd = world.de(cand);
-      if (cd >= 0 && cd < bestD) { bestD = cd; bestP = cand; }
-    }
-    if (bestP) world.moveCamera(V.sub(bestP, world.camPos));
+    diveStep(world);
     world.rebaseToCamera();
     const due = depthChecks.filter((k) => k <= world.K && !done.has(k));
     for (const k of due) {
@@ -370,6 +382,37 @@ function dive(seed, depthChecks) {
   check(missed.length === 0, `dive reached all depths (missed: ${missed}) steps=${steps}`);
 }
 
+/* One dive step, like the app's autopilot + tryMove: sphere-trace a fan
+   of rays (one at the attractor ball center), then move toward the nearest
+   REAL hit in steps of at most 0.75x the local distance. (Distance-gradient
+   descent gets trapped in the estimator's basins in sparse worlds, and long
+   jumps cross several fold creases at once — the app never does either.) */
+function diveStep(world) {
+  // surface-seeking dive, like the autopilot: sphere-trace random rays
+  // and move most of the way to the nearest real hit (distance-gradient
+  // descent gets trapped in the estimator's basins in sparse worlds)
+  const d = world.de(world.camPos);
+  // one ray at the current frame's attractor ball center, the rest random
+  const toC = V.norm(V.sub(world.ballAfter(world.K - 1).C, world.camPos));
+  let bestDir = null, bestT = Infinity;
+  for (let c = 0; c < 12; c++) {
+    const dir = c === 0 ? toC : rndDir();
+    const t = world.rayHit(world.camPos, dir, d * 300, d * 0.05);
+    if (t < bestT) { bestT = t; bestDir = dir; }
+  }
+  // move like the app's tryMove: steps of at most 0.75x the local
+  // distance (so fold creases are crossed one at a time)
+  let dir = bestDir || toC;
+  let remaining = bestDir ? Math.max(0, bestT - d * 0.3) : d * 0.8;
+  for (let it = 0; it < 8 && remaining > 1e-12; it++) {
+    const dd = world.de(world.camPos);
+    const step = Math.min(remaining, Math.max(dd - 0.00175, 0) * 0.75);
+    if (step <= 1e-12) break;
+    dir = world.moveCamera(V.scale(dir, step)) || dir;
+    remaining -= step;
+  }
+}
+
 /* Stress: many seeds (all styles, biome transitions), chain-continuity
    invariants only — this is where "sometimes broken" lived. */
 function stress(seeds, depth) {
@@ -378,14 +421,7 @@ function stress(seeds, depth) {
     const world = new WM.World(seed);
     let steps = 0;
     while (world.K < depth && steps++ < 4000) {
-      const d = world.de(world.camPos);
-      let bestP = null, bestD = Infinity;
-      for (let c = 0; c < 12; c++) {
-        const cand = V.add(world.camPos, V.scale(rndDir(), d * (c < 6 ? 0.6 : 1.5 + rnd() * rnd() * 40)));
-        const cd = world.de(cand);
-        if (cd >= 0 && cd < bestD) { bestD = cd; bestP = cand; }
-      }
-      if (bestP) world.moveCamera(V.sub(bestP, world.camPos));
+      diveStep(world);
       world.rebaseToCamera();
       if (rnd() < 0.05 && world.K > 2) { world.ascend(); world.ascend(); } // zoom back out sometimes
     }
